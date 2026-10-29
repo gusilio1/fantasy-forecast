@@ -58,6 +58,10 @@ DAILY_STARTS_FILE = os.path.join(BASE_DIR, "league_daily_starts.csv")
 TEAM_DAYS_FILE = os.path.join(BASE_DIR, "league_team_days.csv")
 REFRESH_RECENT_DAYS = 2
 
+# Weekly add limit if ESPN does not report your league's real one. ESPN stores
+# "no limit" as 0 or -1; set e.g. 7 here if your league caps adds at 7 a week.
+ACQUISITION_LIMIT_OVERRIDE = 3       # league rule: 3 adds per week
+
 LEAGUE_URL = (
     "https://lm-api-reads.fantasy.espn.com/apis/v3/games/fba/"
     f"seasons/{SEASON}/segments/0/leagues/{LEAGUE_ID}"
@@ -295,14 +299,17 @@ def parse_matchups(data: dict) -> pd.DataFrame:
     acq = (data.get("settings") or {}).get("acquisitionSettings") or {}
 
     def _limit(v):
+        # ESPN uses 0 or -1 for "no limit" (leagues with a 0 limit still record adds).
         try:
             v = int(v)
         except (TypeError, ValueError):
             return None
-        return None if v < 0 else v
+        return None if v <= 0 else v
 
     matchup_limit = _limit(acq.get("matchupAcquisitionLimit"))
     limit_per_day = bool(acq.get("matchupLimitPerScoringPeriod", False))
+    if ACQUISITION_LIMIT_OVERRIDE is not None:
+        matchup_limit, limit_per_day = int(ACQUISITION_LIMIT_OVERRIDE), False
     season_limit = _limit(acq.get("acquisitionLimit"))
     remaining_days = DAYS_PER_MATCHUP - first_sim_day
 
