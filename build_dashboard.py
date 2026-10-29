@@ -604,8 +604,10 @@ function renderPickups(){
       html += `<p class="lede">Best moves for ${esc(mine)} with every add it has left, assuming other managers make their usual moves.</p>`;
       html += mineMoves.length ? movesTable(mineMoves, false) +
         `<p class="note">Together these add about ${fmt(total,0)} projected points this week. Moves are made the morning of the day shown; each drop is a player close to waiver replacement level, so no long-term value is given up.</p>`
-        : `<p class="empty">No add clears the minimum gain for ${esc(mine)} this week.</p>`;
+        : `<p class="empty">No recommended moves for ${esc(mine)} right now: no free agent would add at least 5 projected points this week by replacing a player close to waiver level.</p>`;
     }
+  } else {
+    html += `<p class="empty">No recommended moves this run. Either no free agent would add at least 5 projected points by replacing a player close to waiver level, or teams have no adds left this week.</p>`;
   }
   html += `<h2 style="margin-top:28px">Moves other managers are expected to make</h2>
     <p class="lede">The projections assume each manager makes their usual number of adds (their average over past weeks), spent on the best available streams.</p>`;
