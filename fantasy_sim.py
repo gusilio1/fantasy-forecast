@@ -8,6 +8,41 @@ from dotenv import load_dotenv
 
 
 # ============================================================
+# ESPN REQUESTS WITH RETRIES
+# ESPN occasionally answers with an empty or half-written page
+# (HTTP 200 but no JSON). Retry a few times before giving up.
+# ============================================================
+
+import time
+
+ESPN_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+
+def espn_get(url, attempts=5, **kwargs):
+    """Return (response, parsed_json). parsed_json is None if every attempt failed."""
+    kwargs.setdefault("timeout", 30)
+    headers = dict(ESPN_HEADERS)
+    headers.update(kwargs.pop("headers", None) or {})
+    response = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, headers=headers, **kwargs)
+            if response.status_code == 200:
+                try:
+                    return response, response.json()
+                except ValueError:
+                    print(f"  ESPN sent an unreadable reply (attempt {attempt}/{attempts}), retrying...")
+            elif response.status_code in (401, 403, 404):
+                return response, None
+            else:
+                print(f"  ESPN HTTP {response.status_code} (attempt {attempt}/{attempts}), retrying...")
+        except requests.RequestException as error:
+            print(f"  ESPN request error: {error} (attempt {attempt}/{attempts}), retrying...")
+        time.sleep(3 * attempt)
+    return response, None
+
+
+# ============================================================
 # SETTINGS
 # ============================================================
 
@@ -217,21 +252,19 @@ roster_params = [
     ("view", "mSettings")
 ]
 
-response = requests.get(
+response, league_data = espn_get(
     LEAGUE_URL,
     params=roster_params,
     cookies=COOKIES,
     timeout=30
 )
 
-print("Fantasy API HTTP status:", response.status_code)
+print("Fantasy API HTTP status:", response.status_code if response is not None else "no reply")
 
-if response.status_code != 200:
-    print(response.text[:2000])
-    raise SystemExit
-
-
-league_data = response.json()
+if league_data is None:
+    if response is not None:
+        print(response.text[:2000])
+    raise SystemExit("ESPN fantasy league request failed.")
 
 teams = league_data.get("teams", [])
 
@@ -370,7 +403,7 @@ headers = {
         json.dumps(fantasy_filter)
 }
 
-waiver_response = requests.get(
+waiver_response, waiver_data = espn_get(
     LEAGUE_URL,
     params={
         "view": "kona_player_info"
@@ -382,15 +415,13 @@ waiver_response = requests.get(
 
 print(
     "Available-player API HTTP status:",
-    waiver_response.status_code
+    waiver_response.status_code if waiver_response is not None else "no reply"
 )
 
-if waiver_response.status_code != 200:
-    print(waiver_response.text[:2000])
-    raise SystemExit
-
-
-waiver_data = waiver_response.json()
+if waiver_data is None:
+    if waiver_response is not None:
+        print(waiver_response.text[:2000])
+    raise SystemExit("ESPN available-player request failed.")
 
 available_entries = waiver_data.get(
     "players",
@@ -894,7 +925,7 @@ for day_number in range(7):
         "sports/basketball/nba/scoreboard"
     )
 
-    schedule_response = requests.get(
+    schedule_response, schedule_data = espn_get(
         scoreboard_url,
         params={
             "dates": date_string
@@ -902,20 +933,12 @@ for day_number in range(7):
         timeout=30
     )
 
-    if schedule_response.status_code != 200:
-
-        print(
-            "Schedule error:",
-            date_string,
-            schedule_response.status_code
+    if schedule_data is None:
+        # A missing day would silently drop every game that day, so stop instead.
+        raise SystemExit(
+            f"NBA schedule download failed for {date_string} "
+            f"(HTTP {schedule_response.status_code if schedule_response is not None else 'no reply'})."
         )
-
-        continue
-
-
-    schedule_data = (
-        schedule_response.json()
-    )
 
     day_name = day_names[
         day_number
