@@ -10,7 +10,7 @@ Every hour GitHub runs `run_pipeline.py`, which does:
 3. `build_current_player_projections_v3.py`: player projections
 4. `build_full_nba_projection_universe.py`: every NBA roster player
 5. `fetch_espn_matchups.py`: matchups and actual points so far
-6. `weekly_matchup_simulator_v3_1.py`: the simulation and win probabilities
+6. `weekly_matchup_simulator_v3_2.py`: the simulation, pickups and win probabilities
 7. `build_dashboard.py`: the web page
 
 Setup takes about 20 minutes. No command line is needed.
@@ -104,7 +104,10 @@ Common causes:
 ## Changing things
 
 - **Number of simulations**: `SIMS = 2000` near the top of
-  `weekly_matchup_simulator_v3_1.py`. More is smoother but slower.
+  `weekly_matchup_simulator_v3_2.py`. More is smoother but slower.
+- **Pickup advice on the public page**: `PUBLISH_PICKUP_ADVICE = True` in the same
+  file. Set it to `False` to hide every team's recommended moves (the expected
+  moves in the projections still show).
 - **Page title**: `LEAGUE_TITLE` near the top of `build_dashboard.py`.
 - **Updating a file**: upload it again with **Add file**, then **Upload files**;
   the new version replaces the old one.

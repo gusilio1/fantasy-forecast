@@ -1,0 +1,95 @@
+{
+  "validated_on": "held-out games from 2026-01-18",
+  "pace": {
+    "half_life": 15.0,
+    "k": 5.0
+  },
+  "defense": {
+    "FGA": {
+      "half_life": 40.0,
+      "k": 40.0
+    },
+    "FTA": {
+      "half_life": 40.0,
+      "k": 15.0
+    },
+    "AST": {
+      "half_life": 40.0,
+      "k": 40.0
+    },
+    "TOV": {
+      "half_life": 15.0,
+      "k": 5.0
+    },
+    "STL": {
+      "half_life": 40.0,
+      "k": 15.0
+    },
+    "BLK": {
+      "half_life": 15.0,
+      "k": 0.0
+    },
+    "OREB": {
+      "half_life": 40.0,
+      "k": 15.0
+    },
+    "DREB": {
+      "half_life": 15.0,
+      "k": 15.0
+    },
+    "3PA_SHARE": {
+      "half_life": 15.0,
+      "k": 5.0
+    },
+    "2P_PCT": {
+      "half_life": 40.0,
+      "k": 40.0
+    },
+    "3P_PCT": {
+      "half_life": 15.0,
+      "k": null
+    },
+    "FT_PCT": {
+      "half_life": 15.0,
+      "k": null
+    }
+  },
+  "heldout": [
+    {
+      "variant": "Fixed pace, no defense (current)",
+      "player_games": 9513,
+      "FP_MAE": 7.973915126211419,
+      "FP_RMSE": 10.485847732465096,
+      "MAE_gain_vs_current": 0.0,
+      "FP_bias": -0.2763704975220359,
+      "team_FP_MAE": 31.69403529701155
+    },
+    {
+      "variant": "Pace",
+      "player_games": 9513,
+      "FP_MAE": 7.931143445268566,
+      "FP_RMSE": 10.447871945593016,
+      "MAE_gain_vs_current": 0.04277168094285333,
+      "FP_bias": -0.5741676803987488,
+      "team_FP_MAE": 30.68271144431107
+    },
+    {
+      "variant": "Defense",
+      "player_games": 9513,
+      "FP_MAE": 7.924371365925065,
+      "FP_RMSE": 10.402126392674727,
+      "MAE_gain_vs_current": 0.049543760286353766,
+      "FP_bias": -0.1954291476839614,
+      "team_FP_MAE": 30.186925200310917
+    },
+    {
+      "variant": "Pace + defense",
+      "player_games": 9513,
+      "FP_MAE": 7.885811516595543,
+      "FP_RMSE": 10.371107453238555,
+      "MAE_gain_vs_current": 0.08810360961587627,
+      "FP_bias": -0.49074528877297396,
+      "team_FP_MAE": 29.260067150347567
+    }
+  ]
+}

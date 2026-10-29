@@ -30,6 +30,15 @@ jobs:
       - name: Install packages
         run: pip install -r requirements.txt
 
+      # Past days' ESPN lineups (for PPP and records) are downloaded once and
+      # kept here between runs; only the last 2 days are refreshed each hour.
+      - name: Restore season lineup cache
+        uses: actions/cache@v5
+        with:
+          path: league_cache
+          key: league-cache-${{ github.run_id }}
+          restore-keys: league-cache-
+
       - name: Run forecast pipeline
         env:
           ESPN_SWID: ${{ secrets.ESPN_SWID }}

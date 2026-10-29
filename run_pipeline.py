@@ -8,7 +8,7 @@ Runs the whole forecast end to end, in order, and stops at the first failure:
     3. build_current_player_projections_v3.py  player projections
     4. build_full_nba_projection_universe.py   every NBA roster player (public ESPN)
     5. fetch_espn_matchups.py                  matchups + actual points so far (ESPN login)
-    6. weekly_matchup_simulator_v3_1.py        Monte Carlo + win probabilities
+    6. weekly_matchup_simulator_v3_2.py        Monte Carlo, pickups, win probabilities
     7. build_dashboard.py                      site/index.html
 
 Used by the hourly GitHub workflow; also works on your own computer:
@@ -28,7 +28,7 @@ STEPS = [
     ("Player projections", "build_current_player_projections_v3.py"),
     ("Full NBA roster universe", "build_full_nba_projection_universe.py"),
     ("ESPN matchups + points so far", "fetch_espn_matchups.py"),
-    ("Weekly simulation", "weekly_matchup_simulator_v3_1.py"),
+    ("Weekly simulation", "weekly_matchup_simulator_v3_2.py"),
     ("Dashboard page", "build_dashboard.py"),
 ]
 
