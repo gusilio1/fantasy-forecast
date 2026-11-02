@@ -1646,7 +1646,14 @@ def _manager_view(team_roster: pd.DataFrame) -> pd.DataFrame:
     # IMPORTANT: game-day availability is not IR eligibility. An NBA off-day or a
     # failed Q/DTD availability draw must never turn a healthy player into an IR candidate.
     if "_sim_ir_eligible" in x.columns:
-        x.loc[x["_sim_ir_eligible"].astype(bool), "injury_status"] = "OUT"
+        elig = x["_sim_ir_eligible"].astype(bool)
+        status = x["injury_status"].fillna("").astype(str).str.upper().str.strip()\
+            .str.replace(" ", "_").str.replace("-", "_")
+        # A player ESPN lists as OUT who has already returned in this simulation is
+        # NOT IR-eligible. Without this, two returned OUT players on one team were
+        # swapped in and out of IR forever and the simulation never finished.
+        x.loc[~elig & status.isin(DEFINITE_OUT), "injury_status"] = "ACTIVE"
+        x.loc[elig, "injury_status"] = "OUT"
     return x
 
 
@@ -1777,8 +1784,14 @@ def resolve_healthy_ir_players(
     # They stay on IR today, but the loop continues so OTHER healthy IR players
     # are still considered (previously the loop stopped at the first deferral).
     deferred_pids: set[str] = set()
+    max_rounds = 2 * len(team_roster) + 2    # safety net: each round must settle one player
 
     while True:
+        max_rounds -= 1
+        if max_rounds < 0:
+            print("WARNING: IR resolution did not settle; leaving remaining IR players as they are.",
+                  file=sys.__stdout__, flush=True)
+            break
         active = team_roster[team_roster["_sim_rostered"]].copy()
         healthy_ir = active[
             active["_sim_on_ir"]
