@@ -66,6 +66,7 @@ STATUS_SHORT_TERM = {"QUESTIONABLE": 0.5, "Q": 0.5, "DAY_TO_DAY": 0.5, "DTD": 0.
 STATUS_OUT = {"OUT", "O", "INJURY_RESERVE", "INJURED_RESERVE", "SUSPENSION", "SSPD"}
 TEAM_FIXES = {"GS": "GSW", "NO": "NOP", "NY": "NYK", "SA": "SAS", "UTAH": "UTA", "WSH": "WAS"}
 SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+TEAM_SCHEDULE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{}/schedule"
 ET = ZoneInfo("America/New_York")
 
 
@@ -126,22 +127,36 @@ def load_nba_schedule(start: date, end: date) -> pd.DataFrame:
     if os.path.exists(path) and meta.get("fetched") == today and meta.get("end", "") >= str(end) \
             and meta.get("start", "9999") <= str(start):
         return pd.read_csv(path, dtype={"game_id": str})
-    rows, d = [], start
-    while d <= end:
-        w_end = min(d + timedelta(days=6), end)
-        data = _get(SCOREBOARD, {"dates": f"{d:%Y%m%d}-{w_end:%Y%m%d}", "limit": 500})
-        if data is None:
+    # 1) Each team's season schedule (30 requests). 2) If that fails, day by day.
+    rows, ok_teams = [], 0
+    for team_id in range(1, 31):
+        data = _get(TEAM_SCHEDULE.format(team_id), {}, attempts=3)
+        if data and data.get("events"):
+            ok_teams += 1
+            rows += _events_to_rows(data.get("events"))
+        elif team_id <= 2 and ok_teams == 0:
+            break                     # not available: go straight to day by day
+    in_range = sum(str(start) <= r["date"] <= str(end) for r in rows)
+    if ok_teams == 30 and in_range < 2 * ((end - start).days + 1) * 0.5:
+        print(f"Team schedules look incomplete ({in_range} games); downloading day by day instead.")
+        ok_teams = 0
+    if ok_teams < 30:
+        print(f"Team schedules downloaded for {ok_teams} of 30 teams; downloading day by day instead.")
+        rows, failed, d = [], [], start
+        while d <= end:
+            data = _get(SCOREBOARD, {"dates": f"{d:%Y%m%d}"}, attempts=3)
+            if data is None:
+                failed.append(str(d))
+                if len(failed) >= 3 and len(failed) == (d - start).days + 1:
+                    break                 # ESPN not answering at all
+            else:
+                rows += _events_to_rows(data.get("events"))
+            d += timedelta(days=1)
+        if failed:
             if os.path.exists(path):
-                print("WARNING: NBA schedule download failed; using the last saved copy.")
+                print(f"WARNING: NBA schedule download failed for {len(failed)} days; using the last saved copy.")
                 return pd.read_csv(path, dtype={"game_id": str})
-            raise SystemExit("NBA schedule download failed.")
-        got = _events_to_rows(data.get("events"))
-        if not got:   # range query not supported or empty: ask day by day
-            for i in range((w_end - d).days + 1):
-                day = d + timedelta(days=i)
-                got += _events_to_rows((_get(SCOREBOARD, {"dates": f"{day:%Y%m%d}"}) or {}).get("events"))
-        rows += got
-        d = w_end + timedelta(days=1)
+            raise SystemExit(f"NBA schedule download failed for {len(failed)} days (first: {failed[0]}).")
     sched = pd.DataFrame(rows, columns=["game_id", "date", "team_a", "team_b"]).drop_duplicates("game_id")
     sched = sched[(sched["date"] >= str(start)) & (sched["date"] <= str(end))]
     sched.to_csv(path, index=False)
