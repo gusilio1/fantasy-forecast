@@ -2424,6 +2424,7 @@ def simulate_week(
     print()
 
     progress_every = max(sims // 10, 1)
+    quiet_report = time.time()
     move_counter = defaultdict(int)
     availability_counts = defaultdict(lambda: [0, 0])  # [plays, opportunities]
     out_return_offset_counts = defaultdict(lambda: [0, 0, 0])
@@ -2661,6 +2662,14 @@ def simulate_week(
                         future_injury_player_counts[pid] += 1
                         future_injury_player_missed[pid] += int(dur)
 
+        if _PROGRESS_QUEUE is not None:
+            try:
+                _PROGRESS_QUEUE.put_nowait(1)
+            except Exception:
+                pass
+        elif sys.stdout is not sys.__stdout__ and time.time() - quiet_report >= PROGRESS_EVERY_SECONDS:
+            quiet_report = time.time()   # pre-pass on one core: show it's moving
+            print(f"  {sim_index + 1:,} of {sims:,} simulations done", flush=True, file=sys.__stdout__)
         if (sim_index + 1) % progress_every == 0 or sim_index + 1 == sims:
             print(f"Completed {sim_index + 1:,} / {sims:,} simulations")
 
@@ -2824,11 +2833,9 @@ def simulate_week(
 
 WORKERS = int(os.environ.get("SIM_WORKERS", "0")) or (os.cpu_count() or 1)
 _PARALLEL_OK = True     # switched off for the rest of the run if a parallel run fails
-
-
-def _parallel_timeout(sims: int) -> float:
-    """Several times the expected time on GitHub's 4 cores, then fall back to one core."""
-    return 120 + 0.3 * sims
+_PROGRESS_QUEUE = None  # set in worker processes: one message per finished simulation
+STALL_SECONDS = 300     # fall back to one core only if NO simulation finishes for this long
+PROGRESS_EVERY_SECONDS = 30
 _PAR_KW: dict = {}
 
 
@@ -2841,15 +2848,27 @@ def _plain(obj):
     return obj
 
 
+def _init_worker(kw, lineup_values, injury_model, queue):
+    """Runs once in each fresh worker process: hand it this run's inputs."""
+    global _PAR_KW, _FUTURE_INJURY_MODEL, _PROGRESS_QUEUE
+    _PAR_KW = kw
+    _PROGRESS_QUEUE = queue
+    LINEUP_VALUES.clear()
+    LINEUP_VALUES.update(lineup_values)
+    LINEUP_MEMO.clear()
+    _FUTURE_INJURY_MODEL = injury_model
+
+
 def _sim_block(args):
-    sims, seed, quiet = args
+    index, sims, seed, quiet = args
+    t0 = time.time()
     kw = dict(_PAR_KW, sims=sims, seed=seed)
     if quiet:
         with contextlib.redirect_stdout(io.StringIO()):
             out = simulate_week(**kw)
     else:
         out = simulate_week(**kw)
-    return tuple(_plain(x) for x in out)
+    return index, time.time() - t0, tuple(_plain(x) for x in out)
 
 
 def _merge_blocks(blocks, sizes):
@@ -2902,22 +2921,54 @@ def simulate_week_parallel(sims: int, seed: int, **kw):
     import multiprocessing as mp
     _PAR_KW = kw
     sizes = [sims // workers + (1 if i < sims % workers else 0) for i in range(workers)]
-    jobs = [(n, seed + 7919 * i, i > 0) for i, n in enumerate(sizes)]
     print(f"Running {sims:,} simulations on {workers} processor cores "
           f"({', '.join(str(n) for n in sizes)}); diagnostics below are from the first block.", flush=True)
     t0 = time.time()
+    quiet_all = sys.stdout is not sys.__stdout__
+    jobs = [(i, n, seed + 7919 * i, quiet_all or i > 0) for i, n in enumerate(sizes)]
+    blocks = [None] * workers
     try:
-        pool = mp.get_context("fork").Pool(workers)
+        # Fresh worker processes ("spawn"): slower to start than copying this one,
+        # but they can't inherit a stuck lock or thread from it.
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        pool = ctx.Pool(workers, initializer=_init_worker,
+                        initargs=(kw, dict(LINEUP_VALUES), estimate_future_injury_model(), queue))
         try:
-            # Generous limit; if the parallel run fails or stalls, fall back to one core.
-            blocks = pool.map_async(_sim_block, jobs).get(timeout=_parallel_timeout(sims))
+            pending = pool.map_async(_sim_block, jobs)
+            done_sims, last_progress, last_report = 0, time.time(), time.time()
+            while True:
+                try:
+                    results = pending.get(timeout=2)
+                    break
+                except mp.TimeoutError:
+                    pass
+                while True:            # count simulations finished so far
+                    try:
+                        queue.get_nowait()
+                        done_sims += 1
+                        last_progress = time.time()
+                    except Exception:
+                        break
+                now = time.time()
+                if now - last_report >= PROGRESS_EVERY_SECONDS:
+                    print(f"  {done_sims:,} of {sims:,} simulations done ({now - t0:.0f}s)",
+                          flush=True, file=sys.__stdout__)
+                    last_report = now
+                if now - last_progress > STALL_SECONDS:
+                    raise TimeoutError(f"no simulation finished for {STALL_SECONDS}s; {done_sims} of {sims} done")
+            for i, secs, out in results:
+                blocks[i] = out
+            print(f"  all {workers} blocks finished (slowest {max(r[1] for r in results):.0f}s)",
+                  flush=True, file=sys.__stdout__)
         finally:
             pool.terminate()
             pool.join()
     except Exception as exc:
         _PARALLEL_OK = False
-        print(f"WARNING: parallel simulation failed ({type(exc).__name__}: {exc}); "
-              "running on one core instead.", flush=True, file=sys.__stdout__)
+        print(f"WARNING: parallel simulation failed after {time.time() - t0:.0f}s "
+              f"({type(exc).__name__}: {exc}); running on one core instead.",
+              flush=True, file=sys.__stdout__)
         return simulate_week(sims=sims, seed=seed, **kw)
     print(f"Simulations finished in {time.time() - t0:.0f}s.", flush=True)
     return _merge_blocks(blocks, sizes)
