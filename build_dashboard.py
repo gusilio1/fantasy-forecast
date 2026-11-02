@@ -44,7 +44,10 @@ def _p(name):
 
 
 def _read(path):
-    return pd.read_csv(path, dtype={"player_id": str}) if os.path.exists(path) else pd.DataFrame()
+    try:
+        return pd.read_csv(path, dtype={"player_id": str}) if os.path.exists(path) else pd.DataFrame()
+    except pd.errors.EmptyDataError:   # e.g. no days left to simulate once the week is final
+        return pd.DataFrame()
 
 
 def _num(v, nd=1):
@@ -124,6 +127,55 @@ def league_stats(standings_src: pd.DataFrame) -> dict:
                                "team": t["team"], "manager": t["manager"], "player": t["player"], "when": t["when"]})
     return {"ppp": rows, "records": records, "topGames": top_games,
             "weeksDone": int(weeks["matchup_period"].nunique()) if len(weeks) else 0, "currentWeek": cur}
+
+
+def season_payload(managers: dict) -> dict:
+    sf = _read(os.path.join(BASE, "season_forecast.csv"))
+    meta = {}
+    try:
+        with open(os.path.join(BASE, "season_meta.json"), encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    if not len(sf):
+        return {"meta": meta, "teams": [], "weeks": {}}
+    n = int(meta.get("teams") or len(sf))
+    teams = []
+    for _, r in sf.iterrows():
+        name = _str(r["fantasy_team"])
+        teams.append({
+            "name": name, "manager": managers.get(name, ""),
+            "w": int(r["wins"]), "l": int(r["losses"]), "t": int(r["ties"]), "pf": _num(r["points_for"]),
+            "pw": _num(r["proj_wins"], 1), "pl": _num(r["proj_losses"], 1), "pt": _num(r["proj_ties"], 1),
+            "wlo": _num(r["wins_p10"], 0), "whi": _num(r["wins_p90"], 0), "ppf": _num(r["proj_points_for"], 0),
+            "playoff": _num(r["playoff_prob"], 4), "bye": _num(r.get("bye_prob"), 4),
+            "final": _num(r["final_prob"], 4), "title": _num(r["title_prob"], 4),
+            "first": _num(r["first_place_prob"], 4), "last": _num(r["last_place_prob"], 4),
+            "finish": _num(r["mean_finish"], 2),
+            "seeds": [_num(r.get(f"seed_{k}"), 4) for k in range(1, n + 1)],
+            "perWeek": _num(r.get("future_mean_per_week"), 0),
+        })
+    weeks = {}
+    sw = _read(os.path.join(BASE, "season_weeks.csv"))
+    for _, r in sw.iterrows():
+        weeks.setdefault(_str(r["fantasy_team"]), []).append({
+            "mp": int(r["matchup_period"]), "start": _str(r["start"]), "end": _str(r["end"]),
+            "opp": _str(r["opponent"]), "mean": _num(r["mean"], 0), "oppMean": _num(r["opponent_mean"], 0),
+            "win": _num(r["win_prob"], 4)})
+    return {"meta": meta, "teams": teams, "weeks": weeks}
+
+
+def check_payload() -> dict:
+    try:
+        with open(os.path.join(BASE, "model_check_report.json"), encoding="utf-8") as fh:
+            rep = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    snaps = _read(os.path.join(BASE, "history", "team_snapshots.csv"))
+    ps = _read(os.path.join(BASE, "history", "player_snapshots.csv"))
+    rep["saved"] = {"team_forecasts": int(len(snaps)), "player_forecasts": int(len(ps)),
+                    "weeks": int(snaps["matchup_period"].nunique()) if len(snaps) else 0}
+    return rep
 
 
 def load_payload() -> dict:
@@ -225,7 +277,19 @@ def load_payload() -> dict:
     if len(standings_src) and "manager" in standings_src.columns:
         managers = {_str(r["fantasy_team"]): _str(r["manager"]) for _, r in standings_src.iterrows()}
 
+    season, check = season_payload(managers), check_payload()
+    by_name = {r["name"]: r for r in (season.get("teams") or [])}
+    for st in standings:
+        r = by_name.get(st["name"])
+        if r:   # one record everywhere: the season forecast's (from ESPN's decided matchups)
+            st.update({"playoff": r["playoff"], "w": r["w"], "l": r["l"], "t": r["t"], "pf": r["pf"]})
+    if by_name:
+        standings.sort(key=lambda x: (-((x["w"] + 0.5 * x["t"]) / max(x["w"] + x["l"] + x["t"], 1)), -(x["pf"] or 0)))
+        for i, st in enumerate(standings, 1):
+            st["rank"] = i
+
     return {
+        "season": season, "check": check,
         "title": LEAGUE_TITLE, "meta": meta, "dayFull": DAY_FULL, "stats": stats, "managers": managers,
         "teams": team_rows, "matchups": matchups, "rosters": rosters, "standings": standings,
         "topPlayers": top_players, "topTeams": top_teams, "freeAgents": free_agents,
@@ -355,14 +419,24 @@ th.sort{cursor:pointer;user-select:none}
 th.sort[aria-sort="descending"]::after{content:" ↓"}
 th.sort[aria-sort="ascending"]::after{content:" ↑"}
 
+/* Season */
+.seeds{display:flex;gap:2px}
+.seeds i{display:block;width:9px;height:18px;border-radius:2px;background:var(--a)}
+.seeds i.cut{margin-left:4px}
+.key{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:.84rem;margin:10px 0 0}
+.good{color:var(--good)} .bad{color:var(--bad)}
+.subhead{margin-top:28px}
+
 /* Standings rail */
 aside .card{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
 aside h2{font-size:1.15rem;padding:14px 14px 4px}
 aside .lede{padding:0 14px;margin-bottom:8px;font-size:.86rem}
-aside table th,aside table td{padding:8px 8px;font-size:.92rem}
+aside table th,aside table td{padding:8px 6px;font-size:.9rem}
+aside table td.team{padding-right:2px}
 aside td.team{text-align:left;white-space:normal;line-height:1.25}
 aside th.team{text-align:left}
 td.wrapcell{white-space:normal;min-width:9rem}
+td.wrapcell .sub{white-space:normal}
 table.tight th,table.tight td{padding:10px 9px}
 table.tight thead th{white-space:normal;vertical-align:bottom;line-height:1.25}
 .only-sm{display:none}
@@ -392,7 +466,7 @@ table.tight thead th{white-space:normal;vertical-align:bottom;line-height:1.25}
   <aside aria-labelledby="h-standings">
     <div class="card">
       <h2 id="h-standings">Standings</h2>
-      <p class="lede">Record before this week, and each team's chance to win this week.</p>
+      <p class="lede">Record before this week, each team's chance to win this week, and its chance to make the playoffs. PF is points for.</p>
       <div id="standings"></div>
     </div>
   </aside>
@@ -445,12 +519,14 @@ function header(){
 const nd = (D.meta || {}).next_day;
 const PANELS = [
   {id:'matchups', label:'Matchups', render: renderMatchups},
+  {id:'season', label:'Season', render: renderSeason},
   {id:'teams', label:'Teams', render: renderTeams},
   {id:'players', label: nd ? `${day(nd)}'s top players` : 'Top players', render: renderTopPlayers},
   {id:'topteams', label: nd ? `${day(nd)}'s top teams` : 'Top teams', render: renderTopTeams},
   {id:'fa', label:'Free agents', render: renderFreeAgents},
   {id:'rosters', label:'Rosters', render: renderRosters},
   {id:'stats', label:'PPP and records', render: renderStats},
+  {id:'check', label:'Model check', render: renderCheck},
 ];
 let current = 'matchups';
 try { const t = localStorage.getItem('tab'); if (PANELS.some(p => p.id === t)) current = t; } catch (e) {}
@@ -491,6 +567,7 @@ function select(id, remember){
 
 function renderMatchups(){
   if (!D.matchups.length) return `<h2>Matchups</h2><p class="empty">Matchups appear after the ESPN matchup download runs this week.</p>`;
+  const weekDone = !((D.meta || {}).simulated_days || []).length;
   const ms = [...D.matchups].sort((x,y) => ((y.a===mine||y.b===mine) - (x.a===mine||x.b===mine)));
   const card = m => {
     const ta = team[m.a] || {}, tb = team[m.b] || {};
@@ -511,10 +588,12 @@ function renderMatchups(){
         <span class="v">${fmt(ta.pppToDate,1)}</span><span class="k">PPP so far</span><span class="v r">${fmt(tb.pppToDate,1)}</span>
         <span class="v">${fmt(ta.pppRest,1)}</span><span class="k">PPP rest of week</span><span class="v r">${fmt(tb.pppRest,1)}</span>
       </div>
-      <p class="verdict"><b>${esc(fav)} ${pct(Math.max(aw,bw))} to win</b>, by about ${fmt(Math.abs(m.margin || 0))} points. In 80% of simulations they finish between ${side(lo)} and ${side(hi)}.</p>
+      <p class="verdict">${weekDone
+        ? (Math.abs(m.margin || 0) < 0.05 ? `<b>Tied</b> at ${fmt(ta.toDate,1)}.` : `<b>${esc(fav)} won</b> by ${fmt(Math.abs(m.margin || 0),1)} points.`)
+        : `<b>${esc(fav)} ${pct(Math.max(aw,bw))} to win</b>, by about ${fmt(Math.abs(m.margin || 0))} points. In 80% of simulations they finish between ${side(lo)} and ${side(hi)}.`}</p>
     </article>`;
   };
-  return `<h2>Matchups</h2><p class="lede">Win chance is the share of simulations each team finished ahead. Finished days use ESPN's actual scores.</p>
+  return `<h2>Matchups</h2><p class="lede">${weekDone ? "This week is complete: these are ESPN's final scores. The next week's forecast starts once ESPN moves to the new week." : "Win chance is the share of simulations each team finished ahead. Finished days use ESPN's actual scores."}</p>
     <div class="grid">${ms.map(card).join('')}</div>
     <p class="note">PPP is points per player: fantasy points divided by games played by players in the active lineup.</p>`;
 }
@@ -578,6 +657,114 @@ function renderFreeAgents(){
         <td>${p.games}</td><td class="big">${fmt(p.rest,1)}</td><td class="opt">${fmt(p.perGame,1)}</td>
         <td class="opt">${fmt(p.next,1)}</td><td class="opt">${fmt(p.espn,1)}</td></tr>`).join('')
     }</tbody></table></div>`;
+}
+
+/* ---------- Season ---------- */
+const ordinal = n => { const v = Math.round(n), s = ['th','st','nd','rd'], m = v % 100; return v + (s[(m-20)%10] || s[m] || s[0]); };
+function renderSeason(){
+  const S = D.season || {}, M = S.meta || {}, T = S.teams || [];
+  if (!T.length) return `<h2>Season forecast</h2><p class="empty">${M.status === 'regular_season_over'
+    ? 'The regular season is over.' : 'The season forecast appears after the next update.'}</p>`;
+  const P = M.playoff_teams, byes = M.byes || 0, n = T.length;
+  const tb = M.tiebreak === 'h2h' ? 'head-to-head record' : 'points for';
+  const rec = t => `${t.w}-${t.l}${t.t ? '-' + t.t : ''}`;
+  const prec = t => `${fmt(t.pw,1)}-${fmt(t.pl,1)}${t.pt >= .05 ? '-' + fmt(t.pt,1) : ''}`;
+  let html = `<h2>Season forecast</h2>
+    <p class="lede">The rest of the regular season played out ${fmt(M.sims)} times: this week from the full simulation, then ${M.weeks_left_after_this} more week${M.weeks_left_after_this === 1 ? '' : 's'} from a simpler weekly model. The top ${P} make the playoffs${byes ? `, and the top ${byes} get a first-round bye` : ''}. Ties in the standings go to ${tb}.</p>
+    <div class="tablewrap"><table class="num tight"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="l">Team</th>
+      <th scope="col" class="opt">Record</th><th scope="col">Projected</th><th scope="col">Playoffs</th>${byes ? '<th scope="col" class="opt">Bye</th>' : ''}
+      <th scope="col" class="opt">Final</th><th scope="col">Title</th><th scope="col" class="opt">Avg finish</th>
+      <th scope="col" class="l opt">Finishing position</th></tr></thead><tbody>${
+      T.map((t,i) => `<tr class="${t.name===mine?'mine':''}"><td class="rank">${i+1}</td>
+        <td class="l wrapcell">${who(t.name, t.manager)}</td>
+        <td class="opt">${rec(t)}<span class="sub">${fmt(t.pf)} PF</span></td>
+        <td>${prec(t)}<span class="sub opt">${fmt(t.wlo)} to ${fmt(t.whi)} wins</span></td>
+        <td class="big">${pct(t.playoff)}</td>${byes ? `<td class="opt">${pct(t.bye)}</td>` : ''}
+        <td class="opt">${pct(t.final)}</td><td class="big">${pct(t.title)}</td><td class="opt">${ordinal(t.finish)}</td>
+        <td class="l opt"><div class="seeds" role="img" aria-label="${esc(t.name)} finishing-position chances: ${t.seeds.map((p,k) => `${ordinal(k+1)} ${pct(p)}`).join(', ')}">${
+          t.seeds.map((p,k) => `<i class="${k === P ? 'cut' : ''}" style="opacity:${Math.max(0.06, Math.min(1, (p||0)*2.5)).toFixed(2)}" title="${ordinal(k+1)}: ${pct(p)}"></i>`).join('')}</div></td></tr>`).join('')
+    }</tbody></table></div>
+    <p class="note">Projected record includes this week. The finishing-position strip is darker where a finish is more likely; the gap marks the playoff line. Playoff rounds are played out the same way, using each team's projected scores for the playoff weeks.</p>`;
+  const name = mine || T[0].name, wk = (S.weeks || {})[name] || [];
+  html += `<h2 class="subhead">${esc(name)}: the weeks ahead</h2>`;
+  if (!mine) html += `<p class="lede">Choose your team at the top of the page to see its schedule here.</p>`;
+  html += wk.length ? `<div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="l">Week</th><th scope="col" class="l">Opponent</th>
+      <th scope="col" class="opt">Projected</th><th scope="col" class="opt">Opponent</th><th scope="col">Win chance</th></tr></thead><tbody>${
+      wk.slice(0, 8).map(w => `<tr><td class="l">Week ${w.mp}<span class="sub">${esc(dateLabel(w.start))} to ${esc(dateLabel(w.end))}</span></td>
+        <td class="l wrapcell">${esc(w.opp)}<span class="sub only-sm">${fmt(w.mean)} vs ${fmt(w.oppMean)}</span></td><td class="opt">${fmt(w.mean)}</td><td class="opt">${fmt(w.oppMean)}</td>
+        <td class="big ${w.win >= .6 ? 'good' : w.win <= .4 ? 'bad' : ''}">${pct(w.win)}</td></tr>`).join('')
+    }</tbody></table></div>
+    <p class="note">Future weeks use current rosters, each player's projected score, the NBA schedule (games per week matter) and ESPN's injury return dates. They're less certain the further out they are, since rosters and form change.</p>`
+    : `<p class="empty">No future regular-season weeks.</p>`;
+  return html;
+}
+
+/* ---------- Model check ---------- */
+function renderCheck(){
+  const C = D.check || {}, sv = C.saved || {}, cal = (C.calibration || {}).weekly || {};
+  let html = `<h2>How accurate is the forecast?</h2>
+    <p class="lede">Every update saves what was predicted. When a week ends, the predictions are checked against ESPN's actual results, and the simulation adjusts itself if it's been consistently off.</p>`;
+  if (!C.weeks_checked) {
+    html += `<p class="empty">Nothing to check yet. ${sv.team_forecasts ? `${fmt(sv.team_forecasts)} team forecasts and ${fmt(sv.player_forecasts)} player forecasts have been saved${C.history_since ? ' since ' + esc(dateLabel(C.history_since)) : ''}.` : 'Forecasts are saved from the next update.'} The first results appear once this week is finished${(C.players || {}).games ? '' : ', and player results once a day of saved forecasts is complete'}.</p>`;
+  }
+  const byDay = C.weekly_by_day || [], mon = byDay[0];
+  const P = C.players;
+  const cards = [];
+  if (mon) {
+    cards.push({lab:`Favourite won (forecast on ${day(mon.day)})`, val: mon.favourite_won === null ? '–' : Math.round(mon.favourite_won*100) + '%', who:`${mon.team_weeks/2|0} matchups checked`});
+    cards.push({lab:`Average miss on weekly totals (${day(mon.day)})`, val: fmt(mon.mean_abs_error), small:'pts', who: mon.mean_error > 0 ? `Actual scores ran ${fmt(mon.mean_error)} above the forecast on average` : `Actual scores ran ${fmt(-mon.mean_error)} below the forecast on average`});
+    cards.push({lab:'80% ranges that held the result', val: Math.round(mon.in_80_range*100) + '%', who:'Should be close to 80%'});
+  }
+  if (P && P.ours) cards.push({lab:'Average miss per player game', val: fmt(P.ours.mae,1), small:'pts', who: P.espn && P.espn.mae !== null ? `ESPN's projection: ${fmt(P.espn.mae,1)}` : `${fmt(P.games)} games checked`});
+  if (cards.length) html += `<div class="records">${cards.map(c => `<div class="rec"><div class="lab">${esc(c.lab)}</div>
+    <div class="val num">${c.val}${c.small ? `<small>${c.small}</small>` : ''}</div><div class="when">${esc(c.who)}</div></div>`).join('')}</div>`;
+
+  if (byDay.length) html += `<h2 class="subhead">Weekly forecasts by day</h2>
+    <p class="lede">The same week checked from each day's forecast. Later forecasts know more, so they should do better. The Brier score measures win chances: 0 is perfect and 0.25 is a coin flip.</p>
+    <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="l">Forecast made</th><th scope="col">Favourite won</th>
+      <th scope="col">Brier score</th><th scope="col">Average miss</th><th scope="col" class="opt">Actual minus forecast</th><th scope="col">In 80% range</th></tr></thead><tbody>${
+      byDay.map(r => `<tr><td class="l">${esc(day(r.day))}<span class="sub">${r.team_weeks} team-weeks</span></td>
+        <td>${r.favourite_won === null ? '–' : Math.round(r.favourite_won*100) + '%'}</td><td>${fmt(r.brier,3)}</td>
+        <td>${fmt(r.mean_abs_error)}</td><td class="opt">${signed(r.mean_error,0)}</td><td>${Math.round(r.in_80_range*100)}%</td></tr>`).join('')
+    }</tbody></table></div>`;
+
+  if ((C.reliability || []).length) html += `<h2 class="subhead">Do the win chances mean what they say?</h2>
+    <p class="lede">All checked forecasts grouped by the win chance they gave. In a well-calibrated forecast, teams given about 70% win about 70% of the time.</p>
+    <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="l">Win chance given</th><th scope="col">Forecasts</th>
+      <th scope="col">Average given</th><th scope="col">Actually won</th></tr></thead><tbody>${
+      C.reliability.map(r => `<tr><td class="l">${esc(r.range)}</td><td>${r.n}</td><td>${pct(r.predicted)}</td><td class="big">${pct(r.actual)}</td></tr>`).join('')
+    }</tbody></table></div>`;
+
+  if (P && P.ours) {
+    html += `<h2 class="subhead">Player projections</h2>
+      <p class="lede">Each player's projected score for his next game against what he actually scored, for players in a fantasy lineup who played. Lower is better.</p>
+      <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="l">Projection</th><th scope="col">Average miss</th>
+        <th scope="col">Bias</th><th scope="col">Games</th></tr></thead><tbody>
+        <tr><td class="l">This forecast</td><td class="big">${fmt(P.ours.mae,2)}</td><td>${signed(P.ours.bias,2)}</td><td>${fmt(P.ours.n)}</td></tr>
+        ${P.espn && P.espn.n ? `<tr><td class="l">ESPN's projected average</td><td>${fmt(P.espn.mae,2)}</td><td>${signed(P.espn.bias,2)}</td><td>${fmt(P.espn.n)}</td></tr>` : ''}
+        ${P.season_average && P.season_average.n ? `<tr><td class="l">Season average so far</td><td>${fmt(P.season_average.mae,2)}</td><td>${signed(P.season_average.bias,2)}</td><td>${fmt(P.season_average.n)}</td></tr>` : ''}
+      </tbody></table></div><p class="note">Bias is projected minus actual: positive means projections ran high.</p>`;
+  }
+  if ((C.season_by_horizon || []).length) html += `<h2 class="subhead">Season model</h2>
+    <p class="lede">Weekly totals forecast one or more weeks ahead, checked against the result.</p>
+    <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="l">Forecast</th><th scope="col">Team-weeks</th>
+      <th scope="col">Average miss</th><th scope="col">Actual minus forecast</th><th scope="col">Brier score</th></tr></thead><tbody>${
+      C.season_by_horizon.map(r => `<tr><td class="l">${r.weeks_ahead} week${r.weeks_ahead > 1 ? 's' : ''} ahead</td><td>${r.team_weeks}</td>
+        <td>${fmt(r.mean_abs_error)}</td><td>${signed(r.mean_error,0)}</td><td>${fmt(r.brier,3)}</td></tr>`).join('')
+    }</tbody></table></div>`;
+
+  const lvl = cal.bias || 0, spr = cal.spread || 1;
+  html += `<h2 class="subhead">What the forecast has learned</h2>`;
+  html += cal.active
+    ? `<p class="lede">From ${fmt(cal.team_weeks)} checked team-weeks, the simulation now ${Math.abs(lvl) < .002 ? 'keeps its projected totals as they are' : `${lvl > 0 ? 'raises' : 'lowers'} projected remaining points by ${fmt(Math.abs(lvl)*100,1)}%`} and ${Math.abs(spr-1) < .01 ? 'keeps its ranges as they are' : `makes its ranges ${spr > 1 ? 'wider' : 'narrower'} (×${fmt(spr,2)})`}. Both corrections are deliberately cautious: they move only part of the way toward what the results suggest, and grow as more weeks are checked.</p>`
+    : `<p class="lede">No corrections yet: ${esc(cal.reason || 'not enough finished weeks')}. Once enough results are in, the simulation will adjust the level and width of its weekly projections if they've been consistently off.</p>`;
+  if ((C.player_biggest_misses || []).length) html += `<h2 class="subhead">Biggest player surprises</h2>
+    <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="l">Player</th><th scope="col" class="l opt">Date</th>
+      <th scope="col">Projected</th><th scope="col">Actual</th></tr></thead><tbody>${
+      C.player_biggest_misses.map(r => `<tr><td class="l">${esc(r.player)}</td><td class="l opt">${esc(dateLabel(r.date))}</td>
+        <td>${fmt(r.projected,1)}</td><td class="big">${fmt(r.actual,1)}</td></tr>`).join('')
+    }</tbody></table></div>`;
+  return html;
 }
 
 function renderRosters(){
@@ -651,10 +838,11 @@ function bindStats(){
 function renderStandings(){
   const el = $('#standings');
   if (!D.standings.length) { el.innerHTML = `<p class="lede">Standings appear after the ESPN matchup download runs.</p>`; return; }
-  el.innerHTML = `<table class="num"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="team">Team</th><th scope="col">W-L</th><th scope="col">This week</th></tr></thead><tbody>${
+  const po = D.standings.some(s => s.playoff !== null && s.playoff !== undefined);
+  el.innerHTML = `<table class="num"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="team">Team</th><th scope="col">W-L</th><th scope="col">${po ? 'Week' : 'This week'}</th>${po ? '<th scope="col">Playoffs</th>' : ''}</tr></thead><tbody>${
     D.standings.map(s => `<tr class="${s.name===mine?'mine':''}"><td class="rank">${s.rank}</td>
-      <td class="team">${esc(s.name)}<span class="sub">${fmt(s.pf)} points for</span></td>
-      <td>${s.w}-${s.l}${s.t ? '-' + s.t : ''}</td><td>${pct(s.win)}</td></tr>`).join('')
+      <td class="team">${esc(s.name)}<span class="sub">${fmt(s.pf)} PF</span></td>
+      <td>${s.w}-${s.l}${s.t ? '-' + s.t : ''}</td><td>${pct(s.win)}</td>${po ? `<td>${pct(s.playoff)}</td>` : ''}</tr>`).join('')
   }</tbody></table>`;
 }
 

@@ -400,54 +400,57 @@ def team_state_features(r: pd.DataFrame, available: np.ndarray,
     `available` is the health-availability mask (True = can play).
     Absent players are those with available == False.
     """
-    r = r.copy()
+    # New columns are collected first and added in one step: adding ~45 columns one
+    # at a time to a DataFrame was most of this function's run time.
     avail_mask = np.asarray(available, dtype=bool)
     exp = r["exp_minutes"].to_numpy(float)
     hexp = r["healthy_exp_minutes"].to_numpy(float)
     fam = r["position_family"].astype(str).to_numpy()
+    n = len(r)
+    c = {}
 
     absent = ~avail_mask
     important = absent & np.isfinite(exp) & (exp >= IMPORTANT_MINUTES)
 
     # ---- V2 primary-absence block (identical definitions to V2) ------------
-    r["team_minutes_rank"] = pd.Series(exp, index=r.index).rank(method="average", ascending=False)
-    r["important_minutes_lost"] = float(np.nansum(exp[important]))
-    r["total_health_minutes_lost"] = float(np.nansum(exp[absent]))
-    r["important_absent_count"] = float(important.sum())
-    r["health_absent_count"] = float(absent.sum())
+    c["team_minutes_rank"] = pd.Series(exp, index=r.index).rank(method="average", ascending=False).to_numpy()
+    c["important_minutes_lost"] = float(np.nansum(exp[important]))
+    c["total_health_minutes_lost"] = float(np.nansum(exp[absent]))
+    c["important_absent_count"] = float(important.sum())
+    c["health_absent_count"] = float(absent.sum())
 
     if important.any():
         pi = np.flatnonzero(important)[np.argmax(exp[important])]
         pfam = fam[pi]
-        r["primary_absent_minutes"] = float(exp[pi])
+        c["primary_absent_minutes"] = float(exp[pi])
         for key in RATE_COLS:
-            r[f"primary_absent_{key}_rate"] = float(r[f"player_{key}_rate"].iloc[pi])
+            c[f"primary_absent_{key}_rate"] = float(r[f"player_{key}_rate"].iloc[pi])
     else:
         pfam = "NONE"
-        r["primary_absent_minutes"] = 0.0
+        c["primary_absent_minutes"] = 0.0
         for key in RATE_COLS:
-            r[f"primary_absent_{key}_rate"] = np.nan
+            c[f"primary_absent_{key}_rate"] = np.nan
 
-    r["same_family"] = (fam == pfam).astype(float)
-    r["adjacent_family"] = [adjacent_family(pfam, f) for f in fam]
-    r["cross_guard_big"] = [cross_guard_big(pfam, f) for f in fam]
-    r["is_guard"] = (fam == "GUARD").astype(float)
-    r["is_wing"] = (fam == "WING_FORWARD").astype(float)
-    r["is_big"] = (fam == "BIG").astype(float)
-    r["absent_is_guard"] = float(pfam == "GUARD")
-    r["absent_is_wing"] = float(pfam == "WING_FORWARD")
-    r["absent_is_big"] = float(pfam == "BIG")
+    c["same_family"] = (fam == pfam).astype(float)
+    c["adjacent_family"] = [adjacent_family(pfam, f) for f in fam]
+    c["cross_guard_big"] = [cross_guard_big(pfam, f) for f in fam]
+    c["is_guard"] = (fam == "GUARD").astype(float)
+    c["is_wing"] = (fam == "WING_FORWARD").astype(float)
+    c["is_big"] = (fam == "BIG").astype(float)
+    c["absent_is_guard"] = float(pfam == "GUARD")
+    c["absent_is_wing"] = float(pfam == "WING_FORWARD")
+    c["absent_is_big"] = float(pfam == "BIG")
 
     # ---- V3 every-absence block --------------------------------------------
     lost_h = np.where(absent & np.isfinite(hexp), hexp, 0.0)
-    r["history_injury_boost"] = exp - hexp
-    r["lost_guard_minutes"] = float(lost_h[fam == "GUARD"].sum())
-    r["lost_wing_minutes"] = float(lost_h[fam == "WING_FORWARD"].sum())
-    r["lost_big_minutes"] = float(lost_h[fam == "BIG"].sum())
+    c["history_injury_boost"] = exp - hexp
+    c["lost_guard_minutes"] = float(lost_h[fam == "GUARD"].sum())
+    c["lost_wing_minutes"] = float(lost_h[fam == "WING_FORWARD"].sum())
+    c["lost_big_minutes"] = float(lost_h[fam == "BIG"].sum())
     by_fam = {
-        "GUARD": r["lost_guard_minutes"].iloc[0],
-        "WING_FORWARD": r["lost_wing_minutes"].iloc[0],
-        "BIG": r["lost_big_minutes"].iloc[0],
+        "GUARD": c["lost_guard_minutes"],
+        "WING_FORWARD": c["lost_wing_minutes"],
+        "BIG": c["lost_big_minutes"],
     }
     same = np.array([by_fam.get(f, 0.0) for f in fam])
     adj = np.array([
@@ -456,37 +459,39 @@ def team_state_features(r: pd.DataFrame, available: np.ndarray,
     cross = np.array([
         sum(v for g, v in by_fam.items() if cross_guard_big(f, g)) for f in fam
     ])
-    r["same_family_lost_minutes"] = same
-    r["adjacent_family_lost_minutes"] = adj
-    r["cross_family_lost_minutes"] = cross
+    c["same_family_lost_minutes"] = same
+    c["adjacent_family_lost_minutes"] = adj
+    c["cross_family_lost_minutes"] = cross
 
     sorted_lost = np.sort(lost_h[absent])[::-1]
-    r["second_absent_minutes"] = float(sorted_lost[1]) if len(sorted_lost) > 1 else 0.0
+    c["second_absent_minutes"] = float(sorted_lost[1]) if len(sorted_lost) > 1 else 0.0
 
     srate = np.nan_to_num(r["starter_rate5"].to_numpy(float), nan=0.0)
-    r["lost_starter_minutes"] = float((lost_h * srate).sum())
+    c["lost_starter_minutes"] = float((lost_h * srate).sum())
 
     for key in RATE_COLS:
         prate = np.nan_to_num(r[f"player_{key}_rate"].to_numpy(float), nan=0.0)
         vol = float((lost_h * prate).sum())
-        r[f"lost_{key}_volume"] = vol
-        r[f"{key}_x_lost_{key}"] = r[f"player_{key}_rate"].to_numpy(float) * vol
+        c[f"lost_{key}_volume"] = vol
+        c[f"{key}_x_lost_{key}"] = r[f"player_{key}_rate"].to_numpy(float) * vol
 
     total_lost = float(lost_h.sum())
-    r["baseline_share_x_lost"] = r[baseline_col].to_numpy(float) * total_lost / TEAM_MINUTES
+    c["baseline_share_x_lost"] = r[baseline_col].to_numpy(float) * total_lost / TEAM_MINUTES
 
     # ---- return-from-absence block (only if streak columns are present) ----
     if "own_missed_streak" in r.columns:
         st = np.nan_to_num(r["own_missed_streak"].to_numpy(float), nan=0.0)
-        r["own_log_missed_streak"] = np.log1p(st)
-        r["own_returning_flag"] = ((st >= 2) & avail_mask).astype(float)
+        c["own_log_missed_streak"] = np.log1p(st)
+        c["own_returning_flag"] = ((st >= 2) & avail_mask).astype(float)
         returning = (st >= 2) & avail_mask
-        r["returning_teammate_minutes"] = float(np.nansum(np.where(returning, exp, 0.0)))
-        r["returning_teammate_count"] = float(returning.sum())
         # A player's own return should not count as a returning teammate.
-        r["returning_teammate_minutes"] -= np.where(returning, np.nan_to_num(exp), 0.0)
-        r["returning_teammate_count"] -= returning.astype(float)
-    return r
+        c["returning_teammate_minutes"] = (float(np.nansum(np.where(returning, exp, 0.0)))
+                                           - np.where(returning, np.nan_to_num(exp), 0.0))
+        c["returning_teammate_count"] = float(returning.sum()) - returning.astype(float)
+
+    cols = {k: (np.full(n, v, dtype=float) if np.isscalar(v) else np.asarray(v)) for k, v in c.items()}
+    keep = r.drop(columns=[k for k in cols if k in r.columns])
+    return pd.concat([keep, pd.DataFrame(cols, index=r.index)], axis=1)
 
 
 # =============================================================================

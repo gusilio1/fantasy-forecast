@@ -18,6 +18,7 @@ Fantasy scoring:
          + 2*FGM - FGA + 3PM
 """
 
+import json
 import os
 import time
 from datetime import datetime, date, timedelta
@@ -141,14 +142,43 @@ def fetch_json(url, params, attempts=4):
     )
 
 
+# Finished days and games don't change, so their downloads are kept in
+# league_cache/ (saved between runs by the GitHub workflow). Only the most recent
+# REFRESH_DAYS are downloaded again, to pick up late stat corrections.
+CACHE_DIR = os.path.join(BASE_DIR, "league_cache", "boxscores")
+REFRESH_DAYS = 2
+
+
+def _cache_ok(day_iso):
+    return date.fromisoformat(day_iso) < datetime.now().date() - timedelta(days=REFRESH_DAYS)
+
+
+def cached_json(kind, key, day_iso, fetch):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{kind}_{key}.json")
+    if _cache_ok(day_iso) and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            pass
+    data = fetch()
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except OSError:
+        pass
+    return data
+
+
 def scoreboard_events(start, end):
     events = {}
     d = start
 
     while d <= end:
-        data = fetch_json(
-            SCOREBOARD_URL,
-            {"dates": d.strftime("%Y%m%d"), "limit": 100},
+        data = cached_json(
+            "scoreboard", d.strftime("%Y%m%d"), d.isoformat(),
+            lambda: fetch_json(SCOREBOARD_URL, {"dates": d.strftime("%Y%m%d"), "limit": 100}),
         )
 
         for event in data.get("events", []):
@@ -452,10 +482,23 @@ for i, (event_id, fallback_date) in enumerate(
     start=1,
 ):
     try:
-        rows = parse_game(
-            event_id,
-            fallback_date,
-        )
+        cache_path = os.path.join(CACHE_DIR, f"game_{event_id}.json")
+        rows = None
+        if _cache_ok(fallback_date) and os.path.exists(cache_path):
+            try:
+                with open(cache_path, encoding="utf-8") as fh:
+                    rows = json.load(fh)
+            except (OSError, ValueError):
+                rows = None
+        if rows is None:
+            rows = parse_game(
+                event_id,
+                fallback_date,
+            )
+            if rows and _cache_ok(fallback_date):
+                with open(cache_path, "w", encoding="utf-8") as fh:
+                    json.dump(rows, fh, default=lambda v: v.item() if hasattr(v, "item") else str(v))
+            time.sleep(0.05)
 
         if rows:
             all_rows.extend(rows)
@@ -475,8 +518,6 @@ for i, (event_id, fallback_date) in enumerate(
             f"[{i}/{len(events)}] "
             f"{event_id}: ERROR {exc}"
         )
-
-    time.sleep(0.05)
 
 history = pd.DataFrame(all_rows)
 

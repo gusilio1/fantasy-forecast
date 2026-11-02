@@ -6,7 +6,7 @@ on:
   workflow_dispatch:           # "Run workflow" button for a manual refresh
 
 permissions:
-  contents: read
+  contents: write      # saves the self-test history to the "data" branch
   pages: write
   id-token: write
 
@@ -39,12 +39,38 @@ jobs:
           key: league-cache-${{ github.run_id }}
           restore-keys: league-cache-
 
+      # The self-test's record of past forecasts lives on a separate "data" branch,
+      # so it survives between runs without cluttering your main files.
+      - name: Restore forecast history
+        run: |
+          if git fetch --depth=1 origin data 2>/dev/null; then
+            git checkout FETCH_HEAD -- history && echo "History restored." || echo "No history folder yet."
+          else
+            echo "No saved history yet (first run)."
+          fi
+
       - name: Run forecast pipeline
         env:
           ESPN_SWID: ${{ secrets.ESPN_SWID }}
           ESPN_S2: ${{ secrets.ESPN_S2 }}
           TZ: America/New_York
         run: python run_pipeline.py
+
+      - name: Save forecast history
+        if: success()
+        run: |
+          if [ -d history ]; then
+            tmp=$(mktemp -d)
+            cp -r history "$tmp/"
+            cd "$tmp"
+            git init -q
+            git checkout -q -b data
+            git add history
+            git -c user.name="forecast-bot" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Forecast history $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
+            echo "History saved."
+          fi
 
       - uses: actions/upload-pages-artifact@v5
         with:

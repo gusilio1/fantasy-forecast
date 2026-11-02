@@ -57,6 +57,8 @@ RAW_FILE = os.path.join(BASE_DIR, "espn_matchups_raw.json")
 CACHE_DIR = os.path.join(BASE_DIR, "league_cache")
 DAILY_STARTS_FILE = os.path.join(BASE_DIR, "league_daily_starts.csv")
 TEAM_DAYS_FILE = os.path.join(BASE_DIR, "league_team_days.csv")
+SCHEDULE_FILE = os.path.join(BASE_DIR, "league_schedule.csv")
+SETTINGS_FILE = os.path.join(BASE_DIR, "league_settings.json")
 REFRESH_RECENT_DAYS = 2
 
 # Weekly add limit if ESPN does not report your league's real one. ESPN stores
@@ -287,6 +289,50 @@ def _points_by_period(side: dict) -> dict[int, float]:
     return out
 
 
+def save_schedule_and_settings(data: dict) -> None:
+    """The whole season's fantasy schedule and the league's playoff settings, for season_forecast.py."""
+    rows = []
+    for m in data.get("schedule") or []:
+        home, away = m.get("home") or {}, m.get("away") or {}
+        rows.append({
+            "matchup_period": m.get("matchupPeriodId"),
+            "matchup_id": m.get("id"),
+            "home_id": home.get("teamId"),
+            "away_id": away.get("teamId"),
+            "home_points": home.get("totalPoints"),
+            "away_points": away.get("totalPoints"),
+            "winner": m.get("winner"),
+            "playoff_tier": m.get("playoffTierType"),
+        })
+    pd.DataFrame(rows, columns=["matchup_period", "matchup_id", "home_id", "away_id", "home_points",
+                                "away_points", "winner", "playoff_tier"]).to_csv(SCHEDULE_FILE, index=False)
+    settings = data.get("settings") or {}
+    sched = settings.get("scheduleSettings") or {}
+    teams = {}
+    for t in data.get("teams") or []:
+        teams[str(t.get("id"))] = {
+            "name": t.get("name") or f"{t.get('location', '')} {t.get('nickname', '')}".strip(),
+            "division_id": t.get("divisionId"),
+        }
+    out = {
+        "matchup_period_count": sched.get("matchupPeriodCount"),
+        "playoff_team_count": sched.get("playoffTeamCount"),
+        "playoff_matchup_period_length": sched.get("playoffMatchupPeriodLength"),
+        "playoff_seeding_rule": sched.get("playoffSeedingRule"),
+        "matchup_periods": sched.get("matchupPeriods"),
+        "divisions": sched.get("divisions"),
+        "status": data.get("status"),
+        "teams": teams,
+    }
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=1, default=str)
+    print(f"\nLeague format from ESPN: {out['matchup_period_count']} regular-season matchups, "
+          f"{out['playoff_team_count']} playoff teams, playoff rounds of "
+          f"{out['playoff_matchup_period_length']} matchup period(s), seeding tiebreak: {out['playoff_seeding_rule']}")
+    future = [r for r in rows if r["winner"] in (None, "UNDECIDED")]
+    print(f"Fantasy schedule: {len(rows)} matchups in total, {len(future)} not yet decided.")
+
+
 def parse_matchups(data: dict) -> pd.DataFrame:
     # ---- current scoring period (today's ESPN day) -------------------------
     status = data.get("status") or {}
@@ -390,6 +436,41 @@ def parse_matchups(data: dict) -> pd.DataFrame:
     completed_sps = [sp for sp in period_sps if sp < done_sp]
     first_sim_day = len(completed_sps)        # 0 = Monday ... 7 = week finished
 
+    # ---- move on to next week before ESPN does ------------------------------------
+    # run_pipeline.py sets WEEK_START to next Monday as soon as Sunday's last NBA game
+    # is final. ESPN switches weeks some hours later; until then, record last week's
+    # final results here and forecast the new week.
+    mp_eff, rolled, last_week = current_mp, False, {}
+    target = os.environ.get("WEEK_START", "").strip()
+    if target:
+        target_date = datetime.strptime(target, "%Y-%m-%d").date()
+        nxt_rows = [m for m in schedule if int(m.get("matchupPeriodId", -1)) == current_mp + 1]
+        if target_date > week_start and nxt_rows:
+            if first_sim_day < DAYS_PER_MATCHUP:
+                print("WARNING: moving to next week, but ESPN does not have every day of last week "
+                      "yet; last week's totals may be incomplete.")
+            for m in schedule:
+                if int(m.get("matchupPeriodId", -1)) != current_mp:
+                    continue
+                home, away = m.get("home") or {}, m.get("away") or {}
+                for side in (home, away):
+                    if side.get("teamId") is not None:
+                        side["totalPoints"] = round(sum(_points_by_period(side).get(sp, 0.0) for sp in period_sps), 2)
+                if home.get("teamId") is not None and away.get("teamId") is not None:
+                    h, a = home["totalPoints"], away["totalPoints"]
+                    m["winner"] = "HOME" if h > a else ("AWAY" if a > h else "TIE")
+                    last_week[home["teamId"]] = (h, a)
+                    last_week[away["teamId"]] = (a, h)
+            mp_eff, rolled = current_mp + 1, True
+            week_start = target_date
+            first_sp = first_sp + DAYS_PER_MATCHUP
+            period_sps = list(range(first_sp, first_sp + DAYS_PER_MATCHUP))
+            completed_sps, first_sim_day = [], 0
+            print(f"Week {current_mp} is final; forecasting week {mp_eff} (starting {week_start}) "
+                  "before ESPN switches over.")
+        elif target_date > week_start:
+            print(f"NOTE: no fantasy matchups found for week {current_mp + 1}; staying on week {current_mp}.")
+
     # ---- league acquisition limits (ESPN: -1 = unlimited) -------------------
     acq = (data.get("settings") or {}).get("acquisitionSettings") or {}
 
@@ -417,8 +498,8 @@ def parse_matchups(data: dict) -> pd.DataFrame:
                 totals[int(k)] = int(v or 0)
             except (TypeError, ValueError):
                 pass
-        used_now = totals.get(current_mp, 0)
-        past = [totals.get(p, 0) for p in range(1, current_mp)]
+        used_now = totals.get(mp_eff, 0)
+        past = [totals.get(p, 0) for p in range(1, mp_eff)]
         season_used = tc.get("acquisitions")
         if matchup_limit is None:
             left_week = None
@@ -429,7 +510,14 @@ def parse_matchups(data: dict) -> pd.DataFrame:
         if season_limit is not None and season_used is not None:
             left_season = max(season_limit - int(season_used), 0)
             left_week = left_season if left_week is None else min(left_week, left_season)
-        rec = ((t.get("record") or {}).get("overall")) or {}
+        rec = dict(((t.get("record") or {}).get("overall")) or {})
+        played = sum(int(rec.get(k) or 0) for k in ("wins", "losses", "ties"))
+        if rolled and t.get("id") in last_week and played < current_mp:   # ESPN's record lacks last week
+            mine, theirs = last_week[t.get("id")]
+            key = "wins" if mine > theirs else ("losses" if mine < theirs else "ties")
+            rec[key] = int(rec.get(key) or 0) + 1
+            rec["pointsFor"] = float(rec.get("pointsFor") or 0) + mine
+            rec["pointsAgainst"] = float(rec.get("pointsAgainst") or 0) + theirs
         team_info[t.get("id")] = {
             "wins": rec.get("wins"), "losses": rec.get("losses"), "ties": rec.get("ties"),
             "points_for": rec.get("pointsFor"), "points_against": rec.get("pointsAgainst"),
@@ -448,16 +536,18 @@ def parse_matchups(data: dict) -> pd.DataFrame:
     rows = []
     fetched = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     for m in data.get("schedule") or []:
-        if int(m.get("matchupPeriodId", -1)) != current_mp:
+        if int(m.get("matchupPeriodId", -1)) != mp_eff:
             continue
         sides = [m.get("home") or {}, m.get("away") or {}]
         sides = [s for s in sides if s.get("teamId") is not None]
         for i, side in enumerate(sides):
             other = sides[1 - i] if len(sides) == 2 else {}
             pbp = _points_by_period(side)
-            if done_sp > current_sp:
+            if done_sp > current_sp and not rolled:
                 pbp[current_sp] = today_points.get(side.get("teamId"), 0.0)
-            if pbp:
+            if rolled:
+                completed, source = 0.0, "pointsByScoringPeriod"
+            elif pbp:
                 completed = sum(pbp.get(sp, 0.0) for sp in completed_sps)
                 source = "pointsByScoringPeriod"
             else:
@@ -465,7 +555,7 @@ def parse_matchups(data: dict) -> pd.DataFrame:
                 completed = float(side.get("totalPoints") or 0.0)
                 source = "totalPoints (fallback)"
             rows.append({
-                "matchup_period": current_mp,
+                "matchup_period": mp_eff,
                 "matchup_id": m.get("id"),
                 "fantasy_team_id": side.get("teamId"),
                 "fantasy_team": team_names.get(side.get("teamId"), ""),
@@ -487,7 +577,7 @@ def parse_matchups(data: dict) -> pd.DataFrame:
                 **team_info.get(side.get("teamId"), {}),
             })
     if not rows:
-        raise SystemExit(f"No matchups found for matchup period {current_mp}.")
+        raise SystemExit(f"No matchups found for matchup period {mp_eff}.")
     return pd.DataFrame(rows)
 
 
@@ -555,6 +645,7 @@ def main():
         df["lineup_mismatch_days"] = np.nan
     names = manager_names(data)
     df["manager"] = df["fantasy_team_id"].map(lambda t: names.get(t, ""))
+    save_schedule_and_settings(data)
 
     df.to_csv(args.out, index=False)
 

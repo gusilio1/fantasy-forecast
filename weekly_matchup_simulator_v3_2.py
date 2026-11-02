@@ -176,6 +176,10 @@ PLANNER_FA_CANDIDATES = 15          # free agents considered per day (best rest-
 MAX_ADDS_IF_UNLIMITED = 7           # cap when the league has no weekly acquisition limit
 DEFAULT_ADDS_IF_UNKNOWN = 2         # per team when ESPN acquisition data is unavailable
 PUBLISH_PICKUP_ADVICE = True        # False = the public page shows expected moves but no advice
+# Self-test corrections learned from past weeks by model_check.py (history/calibration.json).
+# False = always use the raw simulation.
+USE_LEARNED_CORRECTIONS = True
+CALIBRATION_FILE = os.path.join(BASE, "history", "calibration.json")
 
 # Pre-game lineup values {(player_id, day): expected FP if he plays}, set from the
 # pre-pass. Empty = fall back to ESPN's projected average (V3.1 behaviour).
@@ -189,6 +193,28 @@ OUTPUT_TAG = "v1_8"
 
 def output_path(suffix: str) -> str:
     return os.path.join(BASE, f"weekly_matchup_{OUTPUT_TAG}_{suffix}.csv")
+
+
+def load_learned_corrections() -> dict:
+    """Level/spread corrections from history/calibration.json (written by model_check.py)."""
+    out = {"active": False, "bias": 0.0, "spread": 1.0, "team_weeks": 0, "reason": ""}
+    if not USE_LEARNED_CORRECTIONS:
+        out["reason"] = "USE_LEARNED_CORRECTIONS is False"
+        return out
+    try:
+        with open(CALIBRATION_FILE, encoding="utf-8") as fh:
+            cal = (json.load(fh) or {}).get("weekly") or {}
+    except (OSError, ValueError):
+        out["reason"] = "no self-test results yet"
+        return out
+    out.update({
+        "active": bool(cal.get("active")),
+        "bias": float(np.clip(cal.get("bias", 0.0), -0.10, 0.10)),
+        "spread": float(np.clip(cal.get("spread", 1.0), 0.75, 1.5)),
+        "team_weeks": int(cal.get("team_weeks", 0)),
+        "reason": "" if cal.get("active") else cal.get("reason", "not enough finished weeks yet"),
+    })
+    return out
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -525,26 +551,30 @@ def best_expected_lineup(candidates: pd.DataFrame, day: str | None = None):
 
     dp = {0: (0.0, [])}
 
-    for player_index, player in c.iterrows():
-        eligible_ids = parse_eligible_slot_ids(player["eligible_slot_ids"])
+    # Same DP as before (same order, same tie-breaks), with the per-player values
+    # looked up once instead of inside the inner loop.
+    values = [float(v) for v in c["lineup_value"]]
+    slot_lists = [
+        [(slot_index, 1 << slot_index) for slot_index, slot_id in enumerate(ACTIVE_LINEUP_SLOT_IDS)
+         if slot_id in parse_eligible_slot_ids(e)]
+        for e in c["eligible_slot_ids"]
+    ]
+    for player_index in range(len(c)):
+        value = values[player_index]
+        slots = slot_lists[player_index]
+        if not slots:
+            continue
         current_states = list(dp.items())
 
         for mask, (score, assignments) in current_states:
-            for slot_index, slot_id in enumerate(ACTIVE_LINEUP_SLOT_IDS):
-                bit = 1 << slot_index
-
+            new_score = score + value
+            for slot_index, bit in slots:
                 if mask & bit:
                     continue
-
-                if slot_id not in eligible_ids:
-                    continue
-
                 new_mask = mask | bit
-                new_score = score + float(player["lineup_value"])
-                new_assignments = assignments + [(slot_index, player_index)]
-
-                if new_mask not in dp or new_score > dp[new_mask][0]:
-                    dp[new_mask] = (new_score, new_assignments)
+                old = dp.get(new_mask)
+                if old is None or new_score > old[0]:
+                    dp[new_mask] = (new_score, assignments + [(slot_index, player_index)])
 
     best_mask, (best_score, assignments) = max(
         dp.items(),
@@ -2400,12 +2430,37 @@ def simulate_week(
     rotation_audit = new_rotation_audit()
     base_layoff_state = initial_layoff_state(rotations)
 
+    # ---- fantasy roster state as plain arrays (fast); a DataFrame is only built
+    #      for the rare team that needs an IR decision or a new lineup ----------------
+    tmpl = roster_template.reset_index(drop=True)
+    R_pid = np.array([norm_id(x) for x in tmpl["player_id"]], dtype=object)
+    R_status = tmpl["injury_status"].tolist() if "injury_status" in tmpl.columns else ["ACTIVE"] * len(tmpl)
+    R_start = tmpl["_start_rostered"].astype(bool).to_numpy()
+    R_ir0 = tmpl.apply(is_ir, axis=1).to_numpy(dtype=bool) if len(tmpl) else np.zeros(0, bool)
+    R_games = {d: (pd.to_numeric(tmpl[d], errors="coerce").fillna(0).astype(int) == 1).to_numpy()
+               if d in tmpl.columns else np.zeros(len(tmpl), bool) for d in DAY_NAMES}
+    R_norm_status = [str(x or "").upper().strip().replace(" ", "_").replace("-", "_") for x in R_status]
+    R_count = np.array([
+        (0.0 < status_play_probability(st) < 1.0)
+        or (is_definitely_out(st) and expected_returns.get(pid, {}).get("return_date") is not None)
+        for pid, st in zip(R_pid, R_status)], dtype=bool)
+    team_rows = {str(k): np.asarray(v, dtype=int)
+                 for k, v in tmpl.groupby("fantasy_team_id", dropna=False).indices.items()}
+    team_order = [str(k) for k in tmpl.groupby("fantasy_team_id", dropna=False).groups.keys()]
+
+    def team_frame(rows, rost, on_ir, avail, ir_elig):
+        f = tmpl.iloc[rows].copy()
+        f["_sim_rostered"] = rost[rows]
+        f["_sim_on_ir"] = on_ir[rows]
+        f["_sim_available"] = avail[rows]
+        f["_sim_ir_eligible"] = ir_elig[rows]
+        return f
+
     for sim_index in range(sims):
-        sim_roster = roster_template.copy()
-        sim_roster["_sim_rostered"] = sim_roster["_start_rostered"].astype(bool)
-        sim_roster["_sim_on_ir"] = sim_roster.apply(is_ir, axis=1)
-        sim_roster["_sim_available"] = False
-        sim_roster["_sim_ir_eligible"] = False
+        rost = R_start.copy()
+        on_ir = R_ir0.copy()
+        avail = np.zeros(len(tmpl), dtype=bool)
+        ir_elig = np.zeros(len(tmpl), dtype=bool)
         future_injury_games_left = {}
         seen_moves_this_sim = set()
         layoff_state = dict(base_layoff_state)
@@ -2424,94 +2479,73 @@ def simulate_week(
             if day_index < start_day_index:
                 continue   # finished day: ESPN actual points are added later
             game_date = WEEK_START + pd.Timedelta(days=day_index)
+            game_day_norm = pd.Timestamp(game_date).normalize()
+            games_today = R_games[day]
             # --------------------------------------------------------------
-            # 1. Draw today's availability for fantasy-rostered players.
+            # 1. Draw today's availability for fantasy-rostered players
+            #    (same order and same random draws as the row-by-row version).
             # --------------------------------------------------------------
-            today = draw_v16_availability_for_day(
-                sim_roster, day, game_date, sampled_out_returns, rng, expected_returns=expected_returns
-            )
+            today = {}
+            for i in np.flatnonzero(games_today):
+                today[R_pid[i]] = player_available_today(
+                    R_pid[i], R_status[i], game_date, sampled_out_returns, rng, expected_returns=expected_returns)
             today = {pid: apply_future_injury_availability(pid, av, future_injury_games_left) for pid, av in today.items()}
-            sim_roster["_sim_available"] = sim_roster["player_id"].map(
-                lambda x: bool(today.get(norm_id(x), False))
-            )
+            avail[:] = [bool(today.get(pid, False)) for pid in R_pid]
             # IR eligibility is a persistent HEALTH concept, not game-day availability.
             # Known definite OUT remains eligible until its sampled return date; newly
             # simulated injuries are eligible. Q/DTD/Doubtful and NBA off-days are not.
-            def _ir_eligible_now(row):
-                pid = norm_id(row["player_id"])
+            for i, pid in enumerate(R_pid):
                 if int(future_injury_games_left.get(pid, 0)) > 0:
-                    return True
-                status = str(row.get("injury_status", "") or "").upper().strip().replace(" ", "_").replace("-", "_")
-                if status not in DEFINITE_OUT:
-                    return False
-                sampled = sampled_out_returns.get(pid)
-                if sampled is None:
-                    return True
-                return pd.Timestamp(game_date).normalize() < pd.Timestamp(sampled).normalize()
-            sim_roster["_sim_ir_eligible"] = sim_roster.apply(_ir_eligible_now, axis=1)
+                    ir_elig[i] = True
+                elif R_norm_status[i] not in DEFINITE_OUT:
+                    ir_elig[i] = False
+                else:
+                    sampled = sampled_out_returns.get(pid)
+                    ir_elig[i] = sampled is None or game_day_norm < pd.Timestamp(sampled).normalize()
 
-            for _, row in sim_roster[sim_roster[day] == 1].iterrows():
-                pid = norm_id(row["player_id"])
-                p = status_play_probability(row.get("injury_status"))
-                has_out_return = (
-                    is_definitely_out(row.get("injury_status"))
-                    and expected_returns.get(pid, {}).get("return_date") is not None
-                )
-                if (0.0 < p < 1.0) or has_out_return:
-                    availability_counts[pid][1] += 1
-                    availability_counts[pid][0] += int(bool(today.get(pid, False)))
+            for i in np.flatnonzero(games_today & R_count):
+                pid = R_pid[i]
+                availability_counts[pid][1] += 1
+                availability_counts[pid][0] += int(bool(today.get(pid, False)))
 
             # --------------------------------------------------------------
             # 1b. Planned pickups for today (add free agent, drop streamable).
             # --------------------------------------------------------------
             for mv in moves_by_day.get(day, []):
-                pids = sim_roster["player_id"].map(norm_id)
-                drop_mask = pids.eq(mv["drop_player_id"]) & sim_roster["_sim_rostered"]
-                sim_roster.loc[drop_mask, "_sim_rostered"] = False
-                sim_roster.loc[drop_mask, "_sim_on_ir"] = False
-                add_mask = pids.eq(mv["add_player_id"]) & (~sim_roster["_start_rostered"].astype(bool))
-                sim_roster.loc[add_mask, "_sim_rostered"] = True
-                sim_roster.loc[add_mask, "_sim_on_ir"] = False
+                drop_mask = (R_pid == mv["drop_player_id"]) & rost
+                rost[drop_mask] = False
+                on_ir[drop_mask] = False
+                add_mask = (R_pid == mv["add_player_id"]) & (~R_start)
+                rost[add_mask] = True
+                on_ir[add_mask] = False
 
             # --------------------------------------------------------------
             # 2. Resolve fantasy IR activation/drop, then choose lineups.
             # --------------------------------------------------------------
             starter_team_by_pid = {}
 
-            for team_id, team_idx in sim_roster.groupby(
-                "fantasy_team_id", dropna=False
-            ).groups.items():
-                team_id = str(team_id)
-                team_view = sim_roster.loc[team_idx].copy()
+            for team_id in team_order:
+                rows = team_rows[team_id]
+                if (rost[rows] & on_ir[rows] & avail[rows]).any():
+                    team_view = team_frame(rows, rost, on_ir, avail, ir_elig)
+                    decisions = resolve_healthy_ir_players(team_view, replacement_fpg, day=day)
+                    rost[rows] = team_view["_sim_rostered"].to_numpy(dtype=bool)
+                    on_ir[rows] = team_view["_sim_on_ir"].to_numpy(dtype=bool)
+                    for d in decisions:
+                        if d.used_ir_swap:
+                            moved = next((m.player_name for m in d.moves if m.action == "MOVE_TO_IR"), "UNKNOWN")
+                            key = (d.fantasy_team, "IR_SWAP", d.activated_player_name, moved)
+                        else:
+                            key = (d.fantasy_team, "DROP", d.activated_player_name, d.dropped_player_name or "UNKNOWN")
+                        if key not in seen_moves_this_sim:
+                            move_counter[key] += 1
+                            seen_moves_this_sim.add(key)
 
-                decisions = resolve_healthy_ir_players(team_view, replacement_fpg, day=day)
-                sim_roster.loc[
-                    team_idx, ["_sim_rostered", "_sim_on_ir"]
-                ] = team_view[["_sim_rostered", "_sim_on_ir"]].values
-
-                for d in decisions:
-                    if d.used_ir_swap:
-                        moved = next((m.player_name for m in d.moves if m.action == "MOVE_TO_IR"), "UNKNOWN")
-                        key = (d.fantasy_team, "IR_SWAP", d.activated_player_name, moved)
-                    else:
-                        key = (d.fantasy_team, "DROP", d.activated_player_name, d.dropped_player_name or "UNKNOWN")
-                    if key not in seen_moves_this_sim:
-                        move_counter[key] += 1
-                        seen_moves_this_sim.add(key)
-
-                current_team = sim_roster.loc[team_idx]
-                eligible_ids = tuple(sorted(
-                    norm_id(x) for x in current_team.loc[
-                        current_team["_sim_rostered"]
-                        & (~current_team["_sim_on_ir"])
-                        & (current_team[day] == 1)
-                        & current_team["_sim_available"],
-                        "player_id"
-                    ]
-                ))
+                ok = rost[rows] & ~on_ir[rows] & games_today[rows] & avail[rows]
+                eligible_ids = tuple(sorted(R_pid[rows][ok]))
                 cache_key = (team_id, day, eligible_ids)
                 if cache_key not in lineup_cache:
-                    starters, _, _ = dynamic_daily_lineup(current_team, day)
+                    starters, _, _ = dynamic_daily_lineup(team_frame(rows, rost, on_ir, avail, ir_elig), day)
                     lineup_cache[cache_key] = tuple(norm_id(x["player_id"]) for x in starters)
 
                 for pid in lineup_cache[cache_key]:
@@ -2770,6 +2804,96 @@ def simulate_week(
     injury_diagnostics["team_day_sum"] = team_day_sum
     injury_diagnostics["sims"] = sims
     return team_scores, player_active_fp, player_game_fp, player_games, team_names, id_to_player, rotation_audit, injury_diagnostics
+
+
+# =============================================================================
+# PARALLEL MONTE CARLO
+# =============================================================================
+# The simulations are split across the machine's processor cores (GitHub's runner
+# has 4). Each core runs its own block of simulations with its own random seed and
+# the results are stitched back together, so the output has the same shape and
+# the same statistical meaning as one long run.
+
+WORKERS = int(os.environ.get("SIM_WORKERS", "0")) or (os.cpu_count() or 1)
+_PAR_KW: dict = {}
+
+
+def _plain(obj):
+    """defaultdicts (some with lambdas) -> plain dicts so results can be sent between processes."""
+    if isinstance(obj, defaultdict):
+        obj = dict(obj)
+    if isinstance(obj, dict):
+        return {k: _plain(v) for k, v in obj.items()}
+    return obj
+
+
+def _sim_block(args):
+    sims, seed, quiet = args
+    kw = dict(_PAR_KW, sims=sims, seed=seed)
+    if quiet:
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = simulate_week(**kw)
+    else:
+        out = simulate_week(**kw)
+    return tuple(_plain(x) for x in out)
+
+
+def _merge_blocks(blocks, sizes):
+    (team_scores, pa_fp, pg_fp, player_games, team_names, id_to_player, audit, diag) = blocks[0]
+    def cat(dicts):
+        keys = set().union(*[d.keys() for d in dicts])
+        return {k: np.concatenate([d.get(k, np.zeros(n)) for d, n in zip(dicts, sizes)]) for k in keys}
+    def add(dicts, cast=float):
+        out = defaultdict(cast)
+        for d in dicts:
+            for k, v in d.items():
+                out[k] += v
+        return out
+    team_scores = cat([b[0] for b in blocks])
+    pa_fp = defaultdict(lambda: np.zeros(sum(sizes)), cat([b[1] for b in blocks]))
+    pg_fp = defaultdict(lambda: np.zeros(sum(sizes)), cat([b[2] for b in blocks]))
+    audits = [b[6] for b in blocks]
+    merged_audit = new_rotation_audit()
+    for a in audits:
+        merged_audit["team_events"] += a["team_events"]
+        merged_audit["emergency_events"] += a["emergency_events"]
+        for k in ("minutes_sum_errors", "max_player_minutes", "emergency_ceilings", "important_absent_counts"):
+            merged_audit[k].extend(a[k])
+        for k in ("rotation_sizes", "absent_games", "team_games"):
+            for kk, v in a[k].items():
+                merged_audit[k][kk] += v
+        for pid, r in a["recipient"].items():
+            m = merged_audit["recipient"][pid]
+            m[0] += r[0]; m[1] += r[1]; m[2] += r[2]; m[3] = max(m[3], r[3]); m[4] = min(m[4], r[4])
+        for k in ("names", "teams", "full_strength", "week_start", "healthy"):
+            merged_audit[k].update(a[k])
+    diags = [b[7] for b in blocks]
+    merged_diag = dict(diags[0])
+    merged_diag["future_injury_starts"] = sum(d["future_injury_starts"] for d in diags)
+    merged_diag["future_injury_missed_games"] = sum(d["future_injury_missed_games"] for d in diags)
+    merged_diag["team_starts"] = cat([d["team_starts"] for d in diags])
+    merged_diag["day_fp_sum"] = add([d["day_fp_sum"] for d in diags], float)
+    merged_diag["day_played"] = add([d["day_played"] for d in diags], int)
+    merged_diag["team_day_sum"] = add([d["team_day_sum"] for d in diags], float)
+    merged_diag["sims"] = int(sum(sizes))
+    return team_scores, pa_fp, pg_fp, player_games, team_names, id_to_player, merged_audit, merged_diag
+
+
+def simulate_week_parallel(sims: int, seed: int, **kw):
+    """simulate_week split across processor cores (falls back to one process)."""
+    workers = max(1, min(WORKERS, sims // 50 or 1))
+    if workers == 1:
+        return simulate_week(sims=sims, seed=seed, **kw)
+    import multiprocessing as mp
+    global _PAR_KW
+    _PAR_KW = kw
+    sizes = [sims // workers + (1 if i < sims % workers else 0) for i in range(workers)]
+    jobs = [(n, seed + 7919 * i, i > 0) for i, n in enumerate(sizes)]
+    print(f"Running {sims:,} simulations on {workers} processor cores "
+          f"({', '.join(str(n) for n in sizes)}); diagnostics below are from the first block.", flush=True)
+    with mp.get_context("fork").Pool(workers) as pool:
+        blocks = pool.map(_sim_block, jobs)
+    return _merge_blocks(blocks, sizes)
 
 
 def next_game_day(event_schedule: pd.DataFrame, start_day: int):
@@ -3060,6 +3184,9 @@ def main():
 
     replacement_fpg = audit_roster_manager(rostered, merged)
     expected_returns = download_espn_expected_returns()
+    pd.DataFrame([{"player_id": k, "return_date": (str(v["return_date"].date()) if v.get("return_date") is not None else ""),
+                   "public_status": v.get("public_status")} for k, v in expected_returns.items()],
+                 columns=["player_id", "return_date", "public_status"]).to_csv(output_path("expected_returns"), index=False)
     matchups, start_day, completed_points = load_matchups()
     sim_start_date = WEEK_START + pd.Timedelta(days=min(start_day, 6))
     rotations, live_frame, rotation_model, live_diag = load_live_rotation_context(
@@ -3106,7 +3233,7 @@ def main():
     # ------------------------------------------------------------------
     print(f"\nPre-pass: {PREPASS_SIMS} simulations for daily expected fantasy points ...", flush=True)
     with contextlib.redirect_stdout(io.StringIO()):
-        pre = simulate_week(
+        pre = simulate_week_parallel(
             event_schedule=event_schedule, team_proj=team_proj, rostered=rostered, merged=merged,
             replacement_fpg=replacement_fpg, expected_returns=expected_returns, rotations=rotations,
             nba_status_by_pid=nba_status_by_pid, sims=PREPASS_SIMS, seed=SEED + 1,
@@ -3174,7 +3301,7 @@ def main():
         id_to_player,
         rotation_audit,
         injury_diagnostics,
-    ) = simulate_week(
+    ) = simulate_week_parallel(
         event_schedule=event_schedule,
         team_proj=team_proj,
         rostered=rostered,
@@ -3209,9 +3336,34 @@ def main():
             "ppp_p90": float(np.nanpercentile(per_sim, 90)) if np.isfinite(per_sim).any() else np.nan,
         }
 
+    # Raw simulated rest-of-week (before any learned correction), for the self-test.
+    raw_rows = []
+    for tid, pts in team_scores.items():
+        raw_rows.append({"fantasy_team_id": norm_id(tid), "raw_rest_mean": float(np.mean(pts)),
+                         "raw_rest_sd": float(np.std(pts, ddof=1)) if len(pts) > 1 else 0.0})
+    pd.DataFrame(raw_rows).to_csv(output_path("team_rest_raw"), index=False)
+
+    # Learned corrections (self-test): scale the level and the spread of the
+    # simulated remaining points. Finished days are actual points and never change.
+    corr = load_learned_corrections()
+    if corr["active"] and start_day < 7:
+        b, sp = corr["bias"], corr["spread"]
+        print(f"\nLearned corrections applied: level x{1 + b:.3f}, spread x{sp:.3f} "
+              f"(from {corr['team_weeks']} evaluated team-weeks)")
+        for tid in team_scores:
+            pts = team_scores[tid]
+            m = float(np.mean(pts))
+            team_scores[tid] = np.maximum((m + sp * (pts - m)) * (1 + b), 0.0)
+    else:
+        print("\nLearned corrections: none applied" + (f" ({corr['reason']})" if corr.get("reason") else ""))
+
     # Final weekly score = ESPN actual points from finished days + simulated rest.
     for tid in team_scores:
         team_scores[tid] = team_scores[tid] + completed_points.get(norm_id(tid), 0.0)
+
+    # Every simulated final total (one row per simulation), for the season forecast.
+    pd.DataFrame({norm_id(t): np.round(v, 2) for t, v in team_scores.items()}).to_csv(
+        output_path("team_score_samples"), index=False)
 
     print()
     print("=" * 100)
