@@ -109,12 +109,20 @@ This is deliberately a validation bridge, not the final injury-aware product.
 
 from __future__ import annotations
 
+import os as _os
+# One maths thread per process: the simulation runs one process per core, and
+# multi-threaded maths libraries can hang when a process is split in two.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    _os.environ.setdefault(_v, "1")
+
 import ast
 import contextlib
 import io
 import json
 import os
 import re
+import sys
+import time
 from collections import defaultdict
 from dataclasses import replace
 from typing import Dict, List, Sequence, Tuple
@@ -2815,6 +2823,12 @@ def simulate_week(
 # the same statistical meaning as one long run.
 
 WORKERS = int(os.environ.get("SIM_WORKERS", "0")) or (os.cpu_count() or 1)
+_PARALLEL_OK = True     # switched off for the rest of the run if a parallel run fails
+
+
+def _parallel_timeout(sims: int) -> float:
+    """Several times the expected time on GitHub's 4 cores, then fall back to one core."""
+    return 120 + 0.3 * sims
 _PAR_KW: dict = {}
 
 
@@ -2881,18 +2895,31 @@ def _merge_blocks(blocks, sizes):
 
 def simulate_week_parallel(sims: int, seed: int, **kw):
     """simulate_week split across processor cores (falls back to one process)."""
+    global _PAR_KW, _PARALLEL_OK
     workers = max(1, min(WORKERS, sims // 50 or 1))
-    if workers == 1:
+    if workers == 1 or not _PARALLEL_OK:
         return simulate_week(sims=sims, seed=seed, **kw)
     import multiprocessing as mp
-    global _PAR_KW
     _PAR_KW = kw
     sizes = [sims // workers + (1 if i < sims % workers else 0) for i in range(workers)]
     jobs = [(n, seed + 7919 * i, i > 0) for i, n in enumerate(sizes)]
     print(f"Running {sims:,} simulations on {workers} processor cores "
           f"({', '.join(str(n) for n in sizes)}); diagnostics below are from the first block.", flush=True)
-    with mp.get_context("fork").Pool(workers) as pool:
-        blocks = pool.map(_sim_block, jobs)
+    t0 = time.time()
+    try:
+        pool = mp.get_context("fork").Pool(workers)
+        try:
+            # Generous limit; if the parallel run fails or stalls, fall back to one core.
+            blocks = pool.map_async(_sim_block, jobs).get(timeout=_parallel_timeout(sims))
+        finally:
+            pool.terminate()
+            pool.join()
+    except Exception as exc:
+        _PARALLEL_OK = False
+        print(f"WARNING: parallel simulation failed ({type(exc).__name__}: {exc}); "
+              "running on one core instead.", flush=True, file=sys.__stdout__)
+        return simulate_week(sims=sims, seed=seed, **kw)
+    print(f"Simulations finished in {time.time() - t0:.0f}s.", flush=True)
     return _merge_blocks(blocks, sizes)
 
 
@@ -3232,6 +3259,7 @@ def main():
     # V3.2: pre-pass -> each player's expected FP per remaining day.
     # ------------------------------------------------------------------
     print(f"\nPre-pass: {PREPASS_SIMS} simulations for daily expected fantasy points ...", flush=True)
+    t_pre = time.time()
     with contextlib.redirect_stdout(io.StringIO()):
         pre = simulate_week_parallel(
             event_schedule=event_schedule, team_proj=team_proj, rostered=rostered, merged=merged,
@@ -3240,6 +3268,7 @@ def main():
             start_day_index=start_day, event_players=event_players, event_poss=event_poss,
         )
     pre_diag = pre[7]
+    print(f"Pre-pass done in {time.time() - t_pre:.0f}s.", flush=True)
     n_pre = pre_diag["sims"]
     exp_uncond = {k: v / n_pre for k, v in pre_diag["day_fp_sum"].items()}
     exp_if_plays = {k: pre_diag["day_fp_sum"][k] / n for k, n in pre_diag["day_played"].items() if n > 0}
