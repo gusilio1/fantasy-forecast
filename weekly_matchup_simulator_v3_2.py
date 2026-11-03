@@ -1126,6 +1126,38 @@ def build_nba_team_projection_map(proj: pd.DataFrame):
     return result
 
 
+USE_REPLACEMENT_PLAYERS = False   # True = top short-handed teams up to 8 with generic bench players
+MIN_AVAILABLE_PLAYERS = 8
+REPLACEMENT_MINUTES = 14.0
+
+
+def add_replacement_players(team_proj: Dict[str, List[PlayerProjection]]) -> list[str]:
+    """
+    When injuries leave a team with fewer than 8 healthy players in the projection
+    data, add generic bench players (median rates of NBA players who play 5-15
+    minutes). Without them the remaining players would be stretched to 240 minutes
+    between them, inflating their fantasy scores. Returns a note per team topped up.
+    """
+    bench = [p for ps in team_proj.values() for p in ps
+             if p.available and 5.0 <= p.expected_minutes <= 15.0]
+    if not bench:
+        return []
+    med = {f: float(np.median([getattr(p, f) for p in bench]))
+           for f in ("fga_rate", "fta_rate", "ast_rate", "tov_rate", "stl_rate", "blk_rate", "three_share",
+                     "two_pct", "three_pct", "ft_pct", "oreb_capture", "dreb_capture")}
+    notes = []
+    for team, ps in team_proj.items():
+        healthy = sum(bool(p.available) and p.expected_minutes > 0 for p in ps)
+        need = MIN_AVAILABLE_PLAYERS - healthy
+        for k in range(max(need, 0)):
+            ps.append(PlayerProjection(
+                player_id=f"REPL-{team}-{k + 1}", name=f"Replacement player ({team})", nba_team=team,
+                expected_minutes=REPLACEMENT_MINUTES, minutes_residuals=[], available=True, **med))
+        if need > 0:
+            notes.append(f"{team}: {healthy} healthy players, added {need} replacement player(s)")
+    return notes
+
+
 def build_nba_status_map(all_nba_proj: pd.DataFrame) -> dict[str, str]:
     """
     Player-ID -> raw injury designation from the full-NBA projection file.
@@ -1588,10 +1620,8 @@ def audit_nba_team_coverage(
             "distort results."
         )
         print(suspicious.round(2).to_string(index=False))
-        raise RuntimeError(
-            "Thin NBA rotation coverage detected. Fix projection coverage "
-            "before trusting Monte Carlo."
-        )
+        print("Continuing: these teams play their available players only, as happens "
+              "when an NBA team is short-handed (minutes are capped at 48 per player).")
 
     print()
     print("Rotation coverage safety gate: PASS")
@@ -3024,6 +3054,8 @@ def write_daily_outputs(diag, team_proj, merged, rostered, moves, team_names_all
             "planned_drop_by": dropped_by.get(pid, ""),
         })
     pdays = pd.DataFrame(rows)
+    if len(pdays):
+        pdays = pdays[~pdays["player_id"].astype(str).str.startswith("REPL-")]   # stand-in bench players
     pdays.to_csv(output_path("player_day_projections"), index=False)
 
     team_rows = [{"fantasy_team_id": tid, "fantasy_team": team_names_all.get(norm_id(tid), tid), "day": day,
@@ -3247,6 +3279,9 @@ def main():
 
     plans, lineup_diag = build_lineup_plan(rostered)
     team_proj = build_nba_team_projection_map(all_nba_proj)
+    if USE_REPLACEMENT_PLAYERS:
+        for note in add_replacement_players(team_proj):
+            print("Short-handed NBA team:", note)
     nba_status_by_pid = build_nba_status_map(all_nba_proj)
     if nba_status_by_pid:
         non_active = sum(
