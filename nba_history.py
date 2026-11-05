@@ -11,6 +11,8 @@ this league's scoring, regular season and playoffs.
                          one file per finished game kept in league_cache/pbp/
 
 FP = PTS + REB + 2*AST + 4*STL + 4*BLK - 2*TO + 2*FGM - FGA + 3PM
+2023-24 games use that season's league scoring, which also had +2 per free throw made
+and -1 per free throw attempted (column "scoring" = "old"; "fp_now" = today's scoring).
 Halves are quarters 1+2 and 3+4 (overtime counts toward the game only).
 
 Output: nba_records.json for the dashboard.
@@ -139,35 +141,52 @@ def attach_names(cur: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
 
 
 def records(df: pd.DataFrame) -> dict:
+    """
+    Top lists under two scorings:
+        played  each season's own league scoring (2023-24 had the old free-throw rule)
+        today   today's scoring for every season
+    Each entry also carries its value under the other scoring ("alt").
+    """
     df = df.copy()
-    df["h1"] = df["q1"] + df["q2"]
-    df["h2"] = df["q3"] + df["q4"]
+    for c in ("q1", "q2", "q3", "q4", "ot"):
+        if f"{c}_now" not in df:
+            df[f"{c}_now"] = df[c]
+        df[f"{c}_now"] = df[f"{c}_now"].fillna(df[c])
+    if "fp_now" not in df:
+        df["fp_now"] = df["fp"]
+    df["fp_now"] = df["fp_now"].fillna(df["fp"])
+    df["scoring"] = df.get("scoring", "current")
+    df["scoring"] = df["scoring"].fillna("current")
 
-    def row(r, value, part=None):
+    def row(r, value, alt, part=None):
         return {"player": r.player, "team": r.team, "opp": r.opponent, "date": r.date, "season": r.season,
-                "playoffs": bool(r.playoffs), "fp": int(value), "part": part,
+                "playoffs": bool(r.playoffs), "fp": int(value), "alt": int(alt), "part": part,
+                "old": r.scoring == "old",
                 "line": f"{int(r.pts)} pts, {int(r.reb)} reb, {int(r.ast)} ast"
-                        + (f", {int(r.stl)} stl" if r.stl else "") + (f", {int(r.blk)} blk" if r.blk else "")}
+                        + (f", {int(r.stl)} stl" if r.stl else "") + (f", {int(r.blk)} blk" if r.blk else "")
+                        + (f", {int(r.ftm)}/{int(r.fta)} FT" if r.scoring == "old" and pd.notna(r.fta) else "")}
 
-    def top(frame, col, part_label=None, n=TOP_N, ascending=False):
+    def top(frame, col, alt_col, n=TOP_N, ascending=False):
         f = frame.sort_values([col, "date"], ascending=[ascending, True]).head(n)
-        return [row(r, getattr(r, col), part_label(r) if part_label else None) for r in f.itertuples()]
+        return [row(r, getattr(r, col), getattr(r, alt_col), getattr(r, "part", None)) for r in f.itertuples()]
 
-    def scope(frame):
-        halves = pd.concat([frame.assign(v=frame["h1"], part="1st half"),
-                            frame.assign(v=frame["h2"], part="2nd half")])
-        quarters = pd.concat([frame.assign(v=frame[q], part=f"Q{q[1]}") for q in ("q1", "q2", "q3", "q4")])
-        return {
-            "game": top(frame, "fp"),
-            "half": top(halves, "v", lambda r: r.part),
-            "quarter": top(quarters, "v", lambda r: r.part),
-            "worst": top(frame, "fp", ascending=True, n=10),
-            "games": int(frame["game_id"].nunique()),
-        }
+    def scope(frame, now: bool):
+        sfx, other = ("_now", "") if now else ("", "_now")
+        g = frame.assign(v=frame["fp" + sfx], a=frame["fp" + other])
+        halves = pd.concat([
+            frame.assign(v=frame["q1" + sfx] + frame["q2" + sfx], a=frame["q1" + other] + frame["q2" + other], part="1st half"),
+            frame.assign(v=frame["q3" + sfx] + frame["q4" + sfx], a=frame["q3" + other] + frame["q4" + other], part="2nd half")])
+        quarters = pd.concat([frame.assign(v=frame[q + sfx], a=frame[q + other], part=f"Q{q[1]}")
+                              for q in ("q1", "q2", "q3", "q4")])
+        return {"game": top(g, "v", "a"), "half": top(halves, "v", "a"), "quarter": top(quarters, "v", "a"),
+                "worst": top(g, "v", "a", n=10, ascending=True), "games": int(frame["game_id"].nunique())}
 
-    out = {"All seasons": scope(df)}
-    for s in sorted(df["season"].unique(), reverse=True):
-        out[s] = scope(df[df["season"] == s])
+    out = {}
+    for mode, now in (("played", False), ("today", True)):
+        m = {"All seasons": scope(df, now)}
+        for sn in sorted(df["season"].unique(), reverse=True):
+            m[sn] = scope(df[df["season"] == sn], now)
+        out[mode] = m
     return out
 
 
@@ -176,18 +195,21 @@ def main():
     cur = current_season_games()
     if len(cur):
         cur = attach_names(cur, hist)
+        cur["scoring"] = "current"
+        cur["fp_now"] = cur["fp"]
         df = pd.concat([hist, cur[hist.columns.intersection(cur.columns)]], ignore_index=True)
     else:
         df = hist
     df["playoffs"] = df["playoffs"].astype(str).str.lower().isin(["true", "1"])
     rec = records(df)
-    payload = {"generated_utc": pd.Timestamp.now(tz="UTC").isoformat(), "scopes": rec,
-               "seasons": [k for k in rec if k != "All seasons"]}
+    payload = {"generated_utc": pd.Timestamp.now(tz="UTC").isoformat(), "modes": rec,
+               "seasons": [k for k in rec["played"] if k != "All seasons"]}
     with open(OUT_FILE, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
-    best = rec["All seasons"]["game"][0]
-    print(f"NBA records: {rec['All seasons']['games']:,} games since 2023-24. Best game: "
-          f"{best['player']} {best['fp']} FP ({best['date']}).")
+    best, now = rec["played"]["All seasons"]["game"][0], rec["today"]["All seasons"]["game"][0]
+    print(f"NBA records: {rec['played']['All seasons']['games']:,} games since 2023-24. Best game: "
+          f"{best['player']} {best['fp']} FP ({best['date']}); under today's scoring: "
+          f"{now['player']} {now['fp']} FP ({now['date']}).")
 
 
 if __name__ == "__main__":

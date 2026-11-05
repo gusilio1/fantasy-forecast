@@ -239,7 +239,12 @@ def history_payload(fm: pd.DataFrame) -> dict:
 
     records = []
     if len(normal):
-        records.append(rec("Highest week", normal.loc[normal["points"].idxmax()], normal["points"].max(), "points"))
+        hw = normal.loc[normal["points"].idxmax()]
+        records.append(rec("Highest week", hw, hw["points"], "points", f"vs {hw['opponent']}, normal-length week"))
+        big = w.loc[w["points"].idxmax()]
+        if big.name not in normal.index:
+            records.append(rec("Highest week (any length)", big, big["points"], "points",
+                               f"vs {big['opponent']}, {'long' if ratio[big.name] > 1 else 'short'} week of {int(big['starts'])} starts"))
         records.append(rec("Lowest week", normal.loc[normal["points"].idxmin()], normal["points"].min(), "points"))
     pw = w[w["starts"] >= 20]
     if len(pw):
@@ -256,10 +261,12 @@ def history_payload(fm: pd.DataFrame) -> dict:
         t = both.loc[both["total"].idxmax()]
         records.append(rec("Highest-scoring matchup", t, t["total"], "points", f"{t['manager']} {_num(t['points'],0):,.0f}, {t['opponent']} {_num(t['opp'],0):,.0f}"))
 
+    w["length"] = np.where(ratio > 1.15, "Long week", np.where(ratio < 0.80, "Short week", ""))
     top_weeks = [{"manager": r["manager"], "team": team_now.get(r["manager"], ""), "points": _num(r["points"], 1),
                   "season": r["season"], "week": int(r["week"]), "opponent": r["opponent"], "won": r["result"] == "W",
-                  "ppp": _num(r["ppp"], 2), "playoffs": bool(r["playoffs"])}
-                 for r in normal.sort_values("points", ascending=False).head(15).to_dict("records")]
+                  "ppp": _num(r["ppp"], 2), "playoffs": bool(r["playoffs"]), "length": r["length"],
+                  "starts": _num(r["starts"], 0)}
+                 for r in w.sort_values("points", ascending=False).head(15).to_dict("records")]
 
     seasons = {}
     for sn, g in reg.groupby("season"):
@@ -588,6 +595,7 @@ th.sort[aria-sort="ascending"]::after{content:" ↑"}
 .controls .seg{margin:0}
 .tag{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.02em;padding:1px 6px;border-radius:4px;background:var(--chip);color:var(--muted);margin-left:6px;vertical-align:1px}
 .wl-w{color:var(--good);font-weight:700} .wl-l{color:var(--bad);font-weight:700}
+td.muted{color:var(--muted)}
 
 /* Standings rail */
 aside .card{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
@@ -864,7 +872,7 @@ function renderSeason(){
 
 /* ---------- History ---------- */
 const shortDate = d => { const x = new Date(d + 'T12:00:00'); return isNaN(x) ? d : x.toLocaleDateString('en-AU', {day:'numeric', month:'short', year:'numeric'}); };
-let histScope = 'All seasons', histCat = 'game', leagueSeason = null, h2hMgr = null;
+let histScope = 'All seasons', histCat = 'game', histMode = 'played', leagueSeason = null, h2hMgr = null;
 const CAT_LABEL = {game:'Best games', half:'Best halves', quarter:'Best quarters', worst:'Worst games'};
 function renderHistory(){
   const H = D.history || {}, N = H.nba, L = H.league;
@@ -872,26 +880,30 @@ function renderHistory(){
   if (!N) html += `<p class="empty">NBA records appear after the next update.</p>`;
   else {
     const scopes = ['All seasons', ...(N.seasons || [])];
-    if (!N.scopes[histScope]) histScope = 'All seasons';
-    const S = N.scopes[histScope], list = S[histCat] || [];
-    html += `<p class="lede">Every NBA player's games since 2023-24, regular season and playoffs, scored with this league's fantasy points. Halves are quarters 1–2 and 3–4; overtime counts toward the game only.</p>
+    const M = (N.modes || {})[histMode] || {};
+    if (!M[histScope]) histScope = 'All seasons';
+    const S = M[histScope] || {}, list = S[histCat] || [];
+    const altLabel = histMode === 'played' ? `<span class="opt">Today's scoring</span><span class="only-sm">Today</span>`
+                                           : `<span class="opt">At the time</span><span class="only-sm">Then</span>`;
+    html += `<p class="lede">Every NBA player's games since 2023-24, regular season and playoffs. Until 2023-24 the league also gave +2 for each free throw made and −1 for each attempt. "At the time" scores each game the way the league scored it that season, and "Today's scoring" uses the current rules for every season. Each list shows the other score alongside for comparison. Halves are quarters 1–2 and 3–4; overtime counts toward the game only.</p>
       <div class="controls"><label class="sr-only" for="hist-scope">Season</label>
         <select id="hist-scope">${scopes.map(x => `<option${x === histScope ? ' selected' : ''}>${esc(x)}</option>`).join('')}</select>
+        <div class="seg" role="group" aria-label="Scoring">${[['played','At the time'],['today',"Today's scoring"]].map(([k,v]) => `<button type="button" data-mode="${k}" aria-pressed="${k === histMode}">${v}</button>`).join('')}</div>
         <div class="seg" role="group" aria-label="Record type">${Object.entries(CAT_LABEL).map(([k,v]) => `<button type="button" data-cat="${k}" aria-pressed="${k === histCat}">${v}</button>`).join('')}</div></div>
       <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="l">Player</th>
-        <th scope="col">FP</th>${histCat === 'half' || histCat === 'quarter' ? '<th scope="col" class="l">Part</th>' : ''}
+        <th scope="col">FP</th><th scope="col">${altLabel}</th>${histCat === 'half' || histCat === 'quarter' ? '<th scope="col" class="l opt">Part</th>' : ''}
         <th scope="col" class="l opt">Game</th><th scope="col" class="l opt">Date</th></tr></thead><tbody>${
-        list.map((r,i) => `<tr><td class="rank">${i+1}</td><td class="l">${esc(r.player)}<span class="sub">${esc(r.team)} vs ${esc(r.opp)}${r.playoffs ? ' · Playoffs' : ''}<span class="only-sm">${esc(shortDate(r.date))}</span></span></td>
-          <td class="big">${fmt(r.fp)}</td>${histCat === 'half' || histCat === 'quarter' ? `<td class="l">${esc(r.part)}</td>` : ''}
+        list.map((r,i) => `<tr><td class="rank">${i+1}</td><td class="l">${esc(r.player)}<span class="sub">${esc(r.team)} vs ${esc(r.opp)}${histCat === 'half' || histCat === 'quarter' ? `<span class="only-sm">${esc(r.part)}</span>` : ''}${r.playoffs ? ' · Playoffs' : ''}${r.old ? ' · Old scoring' : ''}<span class="only-sm">${esc(shortDate(r.date))}</span></span></td>
+          <td class="big">${fmt(r.fp)}</td><td class="${r.alt === r.fp ? 'muted' : (r.alt > r.fp ? 'wl-w' : 'wl-l')}">${r.alt === r.fp ? 'Same' : (r.alt > r.fp ? '+' : '−') + fmt(Math.abs(r.alt - r.fp)) + `<span class="sub">${fmt(r.alt)}</span>`}</td>${histCat === 'half' || histCat === 'quarter' ? `<td class="l opt">${esc(r.part)}</td>` : ''}
           <td class="l opt wrapcell">${esc(r.line)}</td><td class="l opt">${esc(dateLabel(r.date))}<span class="sub">${esc(r.season)}</span></td></tr>`).join('')
       }</tbody></table></div>
-      <p class="note">${fmt(S.games)} NBA games. ${histCat === 'half' || histCat === 'quarter' ? 'The Game column is the full-game line. ' : ''}Built from NBA play-by-play: totals match official box scores in 99.6% of player-games; the rest differ by a late stat correction.</p>`;
+      <p class="note">${fmt(S.games)} NBA games. The second column shows how much more (green) or less (red) the same performance scores under the other rules. ${histCat === 'half' || histCat === 'quarter' ? 'The Game column is the full-game line. ' : ''}Built from NBA play-by-play: totals match official box scores in 99.6% of player-games; the rest differ by a late stat correction.</p>`;
   }
 
   html += `<h2 class="subhead">League history</h2>`;
   if (!L) return html + `<p class="empty">League history appears after the next update.</p>`;
   const nameCell = r => `${esc(r.manager)}${r.team ? `<span class="sub">${esc(r.team)}</span>` : '<span class="sub">Former manager</span>'}`;
-  html += `<p class="lede">Every week since 2024-25, when the league went to 12 teams, from the league spreadsheets and, for this season, ESPN. Standings and averages are regular season only. Week-score records only count weeks of about normal length, leaving out short NBA Cup weeks and long All-Star weeks.</p>
+  html += `<p class="lede">Every week since 2024-25, when the league went to 12 teams, from the league spreadsheets and, for this season, ESPN. Standings and averages are regular season only. Week-score records count weeks of about normal length, leaving out short NBA Cup weeks and long All-Star weeks; the any-length record is shown separately.</p>
     <div class="records">${L.records.map(r => `<div class="rec"><div class="lab">${esc(r.label)}</div>
       <div class="val num">${r.unit === 'PPP' ? fmt(r.value,2) : fmt(r.value,0)}<small>${r.unit === 'PPP' ? 'PPP' : 'pts'}</small></div>
       <div class="who">${esc(r.manager)}${r.team ? ` · ${esc(r.team)}` : ''}</div><div class="when">${esc(r.when)}${r.note ? ` · ${esc(r.note)}` : ` · vs ${esc(r.opponent)}`}</div></div>`).join('')}</div>
@@ -917,10 +929,11 @@ function renderHistory(){
     }</tbody></table></div>`;
 
   html += `<h2 class="subhead">Highest-scoring weeks</h2>
+    <p class="lede">All weeks, any length. The long All-Star week (week 17) gives teams many more starts, so it's marked.</p>
     <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="l">Manager</th>
       <th scope="col">Points</th><th scope="col" class="opt">PPP</th><th scope="col" class="l">Week</th></tr></thead><tbody>${
       L.topWeeks.map((r,i) => `<tr><td class="rank">${i+1}</td><td class="l">${esc(r.manager)}<span class="sub">vs ${esc(r.opponent)}, ${r.won ? 'won' : 'lost'}</span></td>
-        <td class="big">${fmt(r.points)}</td><td class="opt">${fmt(r.ppp,2)}</td><td class="l">${esc(r.season)}<span class="sub">Week ${r.week}${r.playoffs ? ', playoffs' : ''}</span></td></tr>`).join('')
+        <td class="big">${fmt(r.points)}</td><td class="opt">${fmt(r.ppp,2)}</td><td class="l">${esc(r.season)}<span class="sub">Week ${r.week}${r.playoffs ? ', playoffs' : ''}${r.length ? ` · ${esc(r.length)} (${fmt(r.starts)} starts)` : ''}</span></td></tr>`).join('')
     }</tbody></table></div>`;
 
   const mgrs = Object.keys(L.h2h).sort();
@@ -944,6 +957,7 @@ function bindHistory(){
   on('league-season', v => leagueSeason = v);
   on('h2h-mgr', v => h2hMgr = v);
   panel.querySelectorAll('.seg button[data-cat]').forEach(b => b.addEventListener('click', () => { histCat = b.dataset.cat; redraw(); }));
+  panel.querySelectorAll('.seg button[data-mode]').forEach(b => b.addEventListener('click', () => { histMode = b.dataset.mode; redraw(); }));
 }
 
 /* ---------- Model check ---------- */
