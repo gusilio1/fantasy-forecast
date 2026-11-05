@@ -7,8 +7,9 @@ this league's scoring, regular season and playoffs.
     2023-24 to 2025-26   nba_fantasy_history_2023_2026.csv.gz (built once from NBA
                          play-by-play; totals match official box scores in 99.6% of
                          player-games, the rest differ by a late stat correction)
-    2026-27 (this season) downloaded from the NBA's own play-by-play feed each run,
-                         one file per finished game kept in league_cache/pbp/
+    2026-27 (this season) from ESPN's play-by-play for each finished game (validated
+                         against ESPN box scores: 98% of player-games exact, quarters
+                         agree with the NBA feed 99%+), cached in league_cache/pbp_espn/
 
 FP = PTS + REB + 2*AST + 4*STL + 4*BLK - 2*TO + 2*FGM - FGA + 3PM
 2023-24 games use that season's league scoring, which also had +2 per free throw made
@@ -28,26 +29,24 @@ import numpy as np
 import pandas as pd
 import requests
 
-from pbp_fantasy import STATS, game_info, period_stats
+from espn_pbp_fantasy import STATS as ESPN_STATS, period_stats_espn, players_in_summary
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE = os.path.join(BASE, "nba_fantasy_history_2023_2026.csv.gz")
-CACHE_DIR = os.path.join(BASE, "league_cache", "pbp")
+CACHE_DIR = os.path.join(BASE, "league_cache", "pbp_espn")
 OUT_FILE = os.path.join(BASE, "nba_records.json")
 CURRENT_SEASON = "2026-27"
-SEASON_CODE = "26"            # NBA game ids: 002YY..... regular season, 004YY..... playoffs
 TOP_N = 25
 
-SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
-PBP_URL = "https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{}.json"
-HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.nba.com/"}
+SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 TEAM_FIXES = {"GS": "GSW", "NO": "NOP", "NY": "NYK", "SA": "SAS", "UTAH": "UTA", "WSH": "WAS"}
 
 
-def _get(url, attempts=3):
+def _get(url, params=None, attempts=3):
     for a in range(1, attempts + 1):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
+            r = requests.get(url, params=params, headers=HEADERS, timeout=30)
             if r.status_code == 200:
                 return r.json()
             if r.status_code in (403, 404):
@@ -58,85 +57,72 @@ def _get(url, attempts=3):
     return None
 
 
-def player_games_from_actions(actions: pd.DataFrame) -> pd.DataFrame:
-    """One row per player-game: totals plus fantasy points by quarter."""
-    ps = period_stats(actions)
-    gi = game_info(actions)
+def _espn_game_rows(summary: dict, gid: str) -> pd.DataFrame:
+    """Player-game rows (totals + quarters) from one ESPN game summary."""
+    ps = period_stats_espn(summary)
+    if ps.empty:
+        return pd.DataFrame()
+    who = players_in_summary(summary)
+    comp = ((summary.get("header") or {}).get("competitions") or [{}])[0]
+    start = pd.to_datetime(comp.get("date"), errors="coerce", utc=True)
+    day = str(start.tz_convert("America/New_York").date()) if pd.notna(start) else ""
+    season_type = int((((summary.get("header") or {}).get("season") or {}).get("type")) or 2)
+    teams = [TEAM_FIXES.get(t, t) for t in {v[1] for v in who.values()} if t]
     ps["q"] = np.where(ps["period"] <= 4, "q" + ps["period"].astype(str), "ot")
-    wide = ps.pivot_table(index=["game_id", "nba_id"], columns="q", values="fp",
-                          aggfunc="sum", fill_value=0).reset_index()
+    wide = ps.pivot_table(index="espn_id", columns="q", values="fp", aggfunc="sum", fill_value=0).reset_index()
     for c in ("q1", "q2", "q3", "q4", "ot"):
         if c not in wide:
             wide[c] = 0
-    tot = ps.groupby(["game_id", "nba_id"], as_index=False)[STATS + ["fp"]].sum()
-    return tot.merge(wide, on=["game_id", "nba_id"]).merge(gi, on=["game_id", "nba_id"])
+    tot = ps.groupby("espn_id", as_index=False)[ESPN_STATS + ["fp"]].sum()
+    g = tot.merge(wide, on="espn_id")
+    g["player"] = g["espn_id"].map(lambda i: who.get(i, ("", ""))[0])
+    g["team"] = g["espn_id"].map(lambda i: TEAM_FIXES.get(who.get(i, ("", ""))[1], who.get(i, ("", ""))[1]))
+    g["opponent"] = g["team"].map(lambda t: next((x for x in teams if x != t), ""))
+    g["game_id"] = f"espn-{gid}"
+    g["nba_id"] = "espn-" + g["espn_id"].astype(str)
+    g["date"] = day
+    g["playoffs"] = season_type == 3
+    return g.drop(columns=["espn_id"])
 
 
 def current_season_games() -> pd.DataFrame:
-    """Finished games this season, one cached file per game."""
+    """
+    This season's finished games from ESPN's play-by-play (the same game summaries the
+    box-score step downloads), one cached file per game in league_cache/pbp_espn/.
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
-    sched = _get(SCHEDULE_URL)
-    if sched is None:
-        print("WARNING: NBA schedule feed not reachable; this season's records use saved games only.")
-        finished = []
-    else:
-        finished = []
-        for day in (sched.get("leagueSchedule") or {}).get("gameDates") or []:
-            for g in day.get("games") or []:
-                gid = str(g.get("gameId") or "")
-                if g.get("gameStatus") == 3 and gid[:3] in ("002", "004") and gid[3:5] == SEASON_CODE:
-                    finished.append(gid)
+    box_path = os.path.join(BASE, "player_game_history_2027_current.csv")
+    if not os.path.exists(box_path):
+        print("No current-season box scores yet; this season's records skipped.")
+        return pd.DataFrame()
+    games = pd.read_csv(box_path, usecols=["game_id"], dtype={"game_id": str})["game_id"].dropna().unique()
     frames, fetched, failed = [], 0, 0
-    have = {f[:-4] for f in os.listdir(CACHE_DIR) if f.endswith(".csv")}
-    for gid in sorted(set(finished) | have):
+    for gid in sorted(games):
         path = os.path.join(CACHE_DIR, f"{gid}.csv")
         if os.path.exists(path):
-            frames.append(pd.read_csv(path, dtype={"game_id": str}))
-            continue
-        data = _get(PBP_URL.format(gid))
-        acts = ((data or {}).get("game") or {}).get("actions")
-        if not acts:
+            try:
+                frames.append(pd.read_csv(path, dtype={"game_id": str, "nba_id": str}))
+                continue
+            except (pd.errors.EmptyDataError, ValueError):
+                pass
+        summary = _get(SUMMARY_URL, params={"event": gid})
+        if not summary or not summary.get("plays"):
             failed += 1
             continue
-        a = pd.DataFrame(acts)
-        a["gameId"] = gid
-        for c in ("assistPersonId", "blockPersonId", "stealPersonId", "teamTricode", "playerNameI", "shotResult"):
-            if c not in a:
-                a[c] = np.nan
-        g = player_games_from_actions(a)
-        g["playoffs"] = gid.startswith("004")
+        g = _espn_game_rows(summary, gid)
+        if g.empty:
+            failed += 1
+            continue
         g.to_csv(path, index=False)
         frames.append(g)
         fetched += 1
-        time.sleep(0.1)
+        time.sleep(0.05)
     print(f"This season: {len(frames)} finished games ({fetched} downloaded this run"
-          + (f", {failed} not available yet" if failed else "") + ")")
+          + (f", {failed} without play-by-play yet" if failed else "") + ")")
     if not frames:
         return pd.DataFrame()
     cur = pd.concat(frames, ignore_index=True)
     cur["season"] = CURRENT_SEASON
-    return cur
-
-
-def attach_names(cur: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
-    """Full names: earlier seasons by NBA id, else ESPN box scores (same date/team/stat line)."""
-    names = hist.dropna(subset=["player"]).groupby("nba_id")["player"].agg(lambda s: s.iloc[-1]).to_dict()
-    cur["player"] = cur["nba_id"].map(names)
-    espn_path = os.path.join(BASE, "player_game_history_2027_current.csv")
-    if cur["player"].isna().any() and os.path.exists(espn_path):
-        e = pd.read_csv(espn_path)
-        need = {"date", "player_name", "team", "points", "rebounds", "assists"}
-        if need <= set(e.columns):
-            e = e.rename(columns={"points": "pts", "rebounds": "reb", "assists": "ast"})
-            e["team"] = e["team"].astype(str).str.upper().replace(TEAM_FIXES)
-            e["date"] = e["date"].astype(str).str[:10]
-            key = ["date", "team", "pts", "reb", "ast"]
-            e = e[~e.duplicated(key, keep=False)]
-            m = cur[~cur.duplicated(key, keep=False)].merge(e[key + ["player_name"]], on=key)
-            more = m.groupby("nba_id")["player_name"].agg(lambda s: s.mode().iat[0])
-            miss = cur["player"].isna()
-            cur.loc[miss, "player"] = cur.loc[miss, "nba_id"].map(more)
-    cur["player"] = cur["player"].fillna(cur.get("short_name"))
     return cur
 
 
@@ -194,7 +180,6 @@ def main():
     hist = pd.read_csv(HISTORY_FILE, dtype={"game_id": str})
     cur = current_season_games()
     if len(cur):
-        cur = attach_names(cur, hist)
         cur["scoring"] = "current"
         cur["fp_now"] = cur["fp"]
         df = pd.concat([hist, cur[hist.columns.intersection(cur.columns)]], ignore_index=True)
