@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import math
+
+import numpy as np
 import os
 
 import pandas as pd
@@ -35,6 +37,29 @@ LEAGUE_TITLE = "League forecast"
 TOP_PLAYERS = 30
 TOP_FREE_AGENTS = 40
 MIN_STARTS_PPP_WEEK = 15     # a week needs this many starts to count for PPP records
+
+# League history (History tab). Spreadsheet name -> the first name ESPN shows now, where
+# they differ, so a manager's seasons join up. Names not listed are matched as they are.
+NAME_ALIASES = {"Hammer": "Hamish"}
+# This season's ESPN team name -> the name that manager has in the spreadsheets, for any
+# manager whose ESPN first name differs from it. Example: {"Gustavo Giants": "Gus"}.
+TEAM_HISTORY_NAMES = {
+    "Gustavo Giants": "Gus",
+    "PBNOJ": "Trent",
+    "Daniel's Dangerous Team": "Burzomi",
+    "YOUNG ANTS": "Hamish",
+    "trembanyama": "Jay",
+    "spida man": "Levi",
+    "The new look Framptons": "Kaden",
+    "Bez Mbengers and Mash": "Tom",
+    "Souv's malakas": "Taeven",
+    "Da Champ": "Will",
+    "The Big KAT-astrophy": "Jackson",
+    "Scoot N Shoot": "Ryder",
+}
+CURRENT_SEASON_LABEL = "2026-27"
+LEAGUE_HISTORY_FILE = "league_history_2024_2026.csv"   # 2023-24 left out: 10-team league
+NBA_RECORDS_FILE = "nba_records.json"
 DAY_FULL = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday", "Thu": "Thursday",
             "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
 
@@ -127,6 +152,133 @@ def league_stats(standings_src: pd.DataFrame) -> dict:
                                "team": t["team"], "manager": t["manager"], "player": t["player"], "when": t["when"]})
     return {"ppp": rows, "records": records, "topGames": top_games,
             "weeksDone": int(weeks["matchup_period"].nunique()) if len(weeks) else 0, "currentWeek": cur}
+
+
+def history_payload(fm: pd.DataFrame) -> dict:
+    """NBA fantasy records since 2023-24 and the league's results since 2023-24 (spreadsheets + ESPN)."""
+    out = {"nba": None, "league": None}
+    try:
+        with open(os.path.join(BASE, NBA_RECORDS_FILE), encoding="utf-8") as fh:
+            out["nba"] = json.load(fh)
+    except (OSError, ValueError):
+        pass
+
+    hist = _read(os.path.join(BASE, LEAGUE_HISTORY_FILE))
+    alias = lambda n: NAME_ALIASES.get(_str(n), _str(n))
+    rows = []
+    for r in hist.to_dict("records"):
+        rows.append({"season": r["season"], "week": int(r["week"]), "manager": alias(r["manager"]),
+                     "opponent": alias(r["opponent"]), "points": float(r["points"]), "opp": float(r["opp_points"]),
+                     "starts": float(r["starts"]) if pd.notna(r["starts"]) else None,
+                     "playoffs": str(r["playoffs"]).lower() == "true", "long": str(r["long_week"]).lower() == "true"})
+
+    # This season, from ESPN: every finished week.
+    td = _read(os.path.join(BASE, "league_team_days.csv"))
+    sched = _read(os.path.join(BASE, "league_schedule.csv"))
+    team_now = {}
+    if len(fm) and len(td) and len(sched):
+        info = fm.drop_duplicates("fantasy_team_id")
+        mgr = {_str(int(float(t))): (_str(m) if "manager" in info.columns and _str(m) else _str(n))
+               for t, m, n in zip(info["fantasy_team_id"], info.get("manager", info["fantasy_team"]), info["fantasy_team"])}
+        tname = {_str(int(float(t))): _str(n) for t, n in zip(info["fantasy_team_id"], info["fantasy_team"])}
+        for t in list(mgr):
+            key = {k.strip().lower(): v for k, v in TEAM_HISTORY_NAMES.items()}.get(tname.get(t, "").strip().lower())
+            if key:
+                mgr[t] = key
+        for t, m in mgr.items():
+            team_now[alias(m)] = tname.get(t, "")
+        cur = int(fm["matchup_period"].iloc[0])
+        done = int(fm["first_sim_day_index"].iloc[0]) >= 7
+        td["tid"] = td["fantasy_team_id"].map(lambda v: _str(int(float(v))))
+        td["starts"] = pd.to_numeric(td["starts"], errors="coerce").fillna(0)
+        wk = td.groupby(["matchup_period", "tid"]).agg(points=("espn_points", "sum"), starts=("starts", "sum"))
+        reg_weeks = int(sched.loc[sched["playoff_tier"].isna() | (sched["playoff_tier"].astype(str) == "NONE"),
+                                  "matchup_period"].max() or 0)
+        for m in sched.to_dict("records"):
+            mp = int(m["matchup_period"])
+            if not (mp < cur or (mp == cur and done)) or pd.isna(m["home_id"]) or pd.isna(m["away_id"]):
+                continue
+            h, a = _str(int(float(m["home_id"]))), _str(int(float(m["away_id"])))
+            if (mp, h) not in wk.index or (mp, a) not in wk.index:
+                continue
+            for me, op in ((h, a), (a, h)):
+                rows.append({"season": CURRENT_SEASON_LABEL, "week": mp, "manager": alias(mgr.get(me, me)),
+                             "opponent": alias(mgr.get(op, op)), "points": float(wk.loc[(mp, me), "points"]),
+                             "opp": float(wk.loc[(mp, op), "points"]), "starts": float(wk.loc[(mp, me), "starts"]),
+                             "playoffs": bool(reg_weeks and mp > reg_weeks), "long": False})
+    if not rows:
+        return out
+    w = pd.DataFrame(rows)
+    w["result"] = np.where(w["points"] > w["opp"], "W", np.where(w["points"] < w["opp"], "L", "T"))
+    w["ppp"] = w["points"] / w["starts"].where(w["starts"] > 0)
+    w["margin"] = w["points"] - w["opp"]
+    reg = w[~w["playoffs"]]
+    # Week lengths vary (short NBA Cup weeks, long All-Star weeks). Score records only use
+    # weeks of roughly normal length: 80-115% of the season's typical starts per team.
+    wk_avg = w.groupby(["season", "week"])["starts"].transform("mean")
+    typical = w.groupby(["season", "week"])["starts"].mean().groupby(level=0).median()
+    ratio = wk_avg / w["season"].map(typical)
+    normal = w[ratio.between(0.80, 1.15)]
+
+    def team_rows(frame):
+        res = []
+        for m, g in frame.groupby("manager"):
+            W, L, T = (g["result"] == "W").sum(), (g["result"] == "L").sum(), (g["result"] == "T").sum()
+            st = g["starts"].sum()
+            res.append({"manager": m, "team": team_now.get(m, ""), "seasons": int(g["season"].nunique()),
+                        "w": int(W), "l": int(L), "t": int(T), "pct": _num((W + 0.5 * T) / max(len(g), 1), 3),
+                        "pf": _num(g["points"].sum(), 0), "avg": _num(g["points"].mean(), 1),
+                        "ppp": _num(g["points"].sum() / st if st else None, 2)})
+        return sorted(res, key=lambda r: (-(r["pct"] or 0), -(r["pf"] or 0)))
+
+    def rec(label, r, value, unit, note=None):
+        return {"label": label, "value": _num(value, 2 if unit == "PPP" else 1), "unit": unit, "manager": r["manager"],
+                "team": team_now.get(r["manager"], ""), "opponent": r["opponent"],
+                "when": f"{r['season']}, week {int(r['week'])}" + (" (playoffs)" if r["playoffs"] else ""),
+                "note": note}
+
+    records = []
+    if len(normal):
+        records.append(rec("Highest week", normal.loc[normal["points"].idxmax()], normal["points"].max(), "points"))
+        records.append(rec("Lowest week", normal.loc[normal["points"].idxmin()], normal["points"].min(), "points"))
+    pw = w[w["starts"] >= 20]
+    if len(pw):
+        records.append(rec("Best PPP week", pw.loc[pw["ppp"].idxmax()], pw["ppp"].max(), "PPP"))
+        records.append(rec("Worst PPP week", pw.loc[pw["ppp"].idxmin()], pw["ppp"].min(), "PPP"))
+    wins = normal[normal["margin"] > 0]
+    if len(wins):
+        b = wins.loc[wins["margin"].idxmax()]
+        records.append(rec("Biggest win", b, b["margin"], "points", f"{_num(b['points'],0):,.0f} to {_num(b['opp'],0):,.0f} vs {b['opponent']}"))
+        c = wins.loc[wins["margin"].idxmin()]
+        records.append(rec("Closest win", c, c["margin"], "points", f"{_num(c['points'],0):,.0f} to {_num(c['opp'],0):,.0f} vs {c['opponent']}"))
+    if len(normal):
+        both = normal.assign(total=normal["points"] + normal["opp"])
+        t = both.loc[both["total"].idxmax()]
+        records.append(rec("Highest-scoring matchup", t, t["total"], "points", f"{t['manager']} {_num(t['points'],0):,.0f}, {t['opponent']} {_num(t['opp'],0):,.0f}"))
+
+    top_weeks = [{"manager": r["manager"], "team": team_now.get(r["manager"], ""), "points": _num(r["points"], 1),
+                  "season": r["season"], "week": int(r["week"]), "opponent": r["opponent"], "won": r["result"] == "W",
+                  "ppp": _num(r["ppp"], 2), "playoffs": bool(r["playoffs"])}
+                 for r in normal.sort_values("points", ascending=False).head(15).to_dict("records")]
+
+    seasons = {}
+    for sn, g in reg.groupby("season"):
+        rows_s = team_rows(g)
+        for i, r in enumerate(rows_s, 1):
+            r["rank"] = i
+        seasons[sn] = {"rows": rows_s, "weeks": int(g["week"].nunique())}
+
+    h2h = {}
+    for (m, o), g in w.groupby(["manager", "opponent"]):
+        h2h.setdefault(m, {})[o] = [int((g["result"] == "W").sum()), int((g["result"] == "L").sum()),
+                                    int((g["result"] == "T").sum())]
+    out["league"] = {
+        "allTime": team_rows(reg), "records": records, "topWeeks": top_weeks,
+        "seasons": dict(sorted(seasons.items(), reverse=True)), "h2h": h2h,
+        "seasonList": sorted(w["season"].unique(), reverse=True),
+        "current": sorted(team_now.keys()),
+    }
+    return out
 
 
 def season_payload(managers: dict) -> dict:
@@ -273,6 +425,7 @@ def load_payload() -> dict:
                               "t": int(r["ties"]), "pf": _num(r["points_for"], 0), "win": win.get(name)})
 
     stats = league_stats(standings_src)
+    history = history_payload(standings_src)
     managers = {}
     if len(standings_src) and "manager" in standings_src.columns:
         managers = {_str(r["fantasy_team"]): _str(r["manager"]) for _, r in standings_src.iterrows()}
@@ -290,6 +443,7 @@ def load_payload() -> dict:
 
     return {
         "season": season, "check": check,
+        "history": history,
         "title": LEAGUE_TITLE, "meta": meta, "dayFull": DAY_FULL, "stats": stats, "managers": managers,
         "teams": team_rows, "matchups": matchups, "rosters": rosters, "standings": standings,
         "topPlayers": top_players, "topTeams": top_teams, "freeAgents": free_agents,
@@ -427,6 +581,14 @@ th.sort[aria-sort="ascending"]::after{content:" ↑"}
 .good{color:var(--good)} .bad{color:var(--bad)}
 .subhead{margin-top:28px}
 
+/* History */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.controls{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;margin:4px 0 12px}
+.controls select{font:500 .92rem var(--font);color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+.controls .seg{margin:0}
+.tag{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.02em;padding:1px 6px;border-radius:4px;background:var(--chip);color:var(--muted);margin-left:6px;vertical-align:1px}
+.wl-w{color:var(--good);font-weight:700} .wl-l{color:var(--bad);font-weight:700}
+
 /* Standings rail */
 aside .card{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
 aside h2{font-size:1.15rem;padding:14px 14px 4px}
@@ -526,6 +688,7 @@ const PANELS = [
   {id:'fa', label:'Free agents', render: renderFreeAgents},
   {id:'rosters', label:'Rosters', render: renderRosters},
   {id:'stats', label:'PPP and records', render: renderStats},
+  {id:'history', label:'History', render: renderHistory},
   {id:'check', label:'Model check', render: renderCheck},
 ];
 let current = 'matchups';
@@ -699,6 +862,90 @@ function renderSeason(){
   return html;
 }
 
+/* ---------- History ---------- */
+const shortDate = d => { const x = new Date(d + 'T12:00:00'); return isNaN(x) ? d : x.toLocaleDateString('en-AU', {day:'numeric', month:'short', year:'numeric'}); };
+let histScope = 'All seasons', histCat = 'game', leagueSeason = null, h2hMgr = null;
+const CAT_LABEL = {game:'Best games', half:'Best halves', quarter:'Best quarters', worst:'Worst games'};
+function renderHistory(){
+  const H = D.history || {}, N = H.nba, L = H.league;
+  let html = `<h2>NBA fantasy records</h2>`;
+  if (!N) html += `<p class="empty">NBA records appear after the next update.</p>`;
+  else {
+    const scopes = ['All seasons', ...(N.seasons || [])];
+    if (!N.scopes[histScope]) histScope = 'All seasons';
+    const S = N.scopes[histScope], list = S[histCat] || [];
+    html += `<p class="lede">Every NBA player's games since 2023-24, regular season and playoffs, scored with this league's fantasy points. Halves are quarters 1–2 and 3–4; overtime counts toward the game only.</p>
+      <div class="controls"><label class="sr-only" for="hist-scope">Season</label>
+        <select id="hist-scope">${scopes.map(x => `<option${x === histScope ? ' selected' : ''}>${esc(x)}</option>`).join('')}</select>
+        <div class="seg" role="group" aria-label="Record type">${Object.entries(CAT_LABEL).map(([k,v]) => `<button type="button" data-cat="${k}" aria-pressed="${k === histCat}">${v}</button>`).join('')}</div></div>
+      <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="l">Player</th>
+        <th scope="col">FP</th>${histCat === 'half' || histCat === 'quarter' ? '<th scope="col" class="l">Part</th>' : ''}
+        <th scope="col" class="l opt">Game</th><th scope="col" class="l opt">Date</th></tr></thead><tbody>${
+        list.map((r,i) => `<tr><td class="rank">${i+1}</td><td class="l">${esc(r.player)}<span class="sub">${esc(r.team)} vs ${esc(r.opp)}${r.playoffs ? ' · Playoffs' : ''}<span class="only-sm">${esc(shortDate(r.date))}</span></span></td>
+          <td class="big">${fmt(r.fp)}</td>${histCat === 'half' || histCat === 'quarter' ? `<td class="l">${esc(r.part)}</td>` : ''}
+          <td class="l opt wrapcell">${esc(r.line)}</td><td class="l opt">${esc(dateLabel(r.date))}<span class="sub">${esc(r.season)}</span></td></tr>`).join('')
+      }</tbody></table></div>
+      <p class="note">${fmt(S.games)} NBA games. ${histCat === 'half' || histCat === 'quarter' ? 'The Game column is the full-game line. ' : ''}Built from NBA play-by-play: totals match official box scores in 99.6% of player-games; the rest differ by a late stat correction.</p>`;
+  }
+
+  html += `<h2 class="subhead">League history</h2>`;
+  if (!L) return html + `<p class="empty">League history appears after the next update.</p>`;
+  const nameCell = r => `${esc(r.manager)}${r.team ? `<span class="sub">${esc(r.team)}</span>` : '<span class="sub">Former manager</span>'}`;
+  html += `<p class="lede">Every week since 2024-25, when the league went to 12 teams, from the league spreadsheets and, for this season, ESPN. Standings and averages are regular season only. Week-score records only count weeks of about normal length, leaving out short NBA Cup weeks and long All-Star weeks.</p>
+    <div class="records">${L.records.map(r => `<div class="rec"><div class="lab">${esc(r.label)}</div>
+      <div class="val num">${r.unit === 'PPP' ? fmt(r.value,2) : fmt(r.value,0)}<small>${r.unit === 'PPP' ? 'PPP' : 'pts'}</small></div>
+      <div class="who">${esc(r.manager)}${r.team ? ` · ${esc(r.team)}` : ''}</div><div class="when">${esc(r.when)}${r.note ? ` · ${esc(r.note)}` : ` · vs ${esc(r.opponent)}`}</div></div>`).join('')}</div>
+
+    <h2 class="subhead">All-time standings</h2>
+    <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="l">Manager</th>
+      <th scope="col" class="opt">Seasons</th><th scope="col">Record</th><th scope="col">Win %</th><th scope="col" class="opt">Avg week</th><th scope="col">PPP</th></tr></thead><tbody>${
+      L.allTime.map((r,i) => `<tr class="${r.team && r.team === mine ? 'mine' : ''}"><td class="rank">${i+1}</td><td class="l">${nameCell(r)}</td><td class="opt">${r.seasons}</td>
+        <td>${r.w}-${r.l}${r.t ? '-' + r.t : ''}</td><td class="big">${fmt(r.pct*100,1)}%</td><td class="opt">${fmt(r.avg)}</td><td>${fmt(r.ppp,2)}</td></tr>`).join('')
+    }</tbody></table></div>`;
+
+  const seasons = Object.keys(L.seasons);
+  if (!leagueSeason || !L.seasons[leagueSeason]) leagueSeason = seasons[0];
+  const SS = L.seasons[leagueSeason];
+  html += `<h2 class="subhead">Season standings</h2>
+    <div class="controls"><label class="sr-only" for="league-season">Season</label>
+      <select id="league-season">${seasons.map(x => `<option${x === leagueSeason ? ' selected' : ''}>${esc(x)}</option>`).join('')}</select>
+      <span class="small">${SS.weeks} regular-season weeks</span></div>
+    <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="l">Manager</th>
+      <th scope="col">Record</th><th scope="col">Points for</th><th scope="col" class="opt">Avg week</th><th scope="col">PPP</th></tr></thead><tbody>${
+      SS.rows.map(r => `<tr class="${r.team && r.team === mine ? 'mine' : ''}"><td class="rank">${r.rank}</td><td class="l">${nameCell(r)}</td>
+        <td>${r.w}-${r.l}${r.t ? '-' + r.t : ''}</td><td>${fmt(r.pf)}</td><td class="opt">${fmt(r.avg)}</td><td>${fmt(r.ppp,2)}</td></tr>`).join('')
+    }</tbody></table></div>`;
+
+  html += `<h2 class="subhead">Highest-scoring weeks</h2>
+    <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="l">Manager</th>
+      <th scope="col">Points</th><th scope="col" class="opt">PPP</th><th scope="col" class="l">Week</th></tr></thead><tbody>${
+      L.topWeeks.map((r,i) => `<tr><td class="rank">${i+1}</td><td class="l">${esc(r.manager)}<span class="sub">vs ${esc(r.opponent)}, ${r.won ? 'won' : 'lost'}</span></td>
+        <td class="big">${fmt(r.points)}</td><td class="opt">${fmt(r.ppp,2)}</td><td class="l">${esc(r.season)}<span class="sub">Week ${r.week}${r.playoffs ? ', playoffs' : ''}</span></td></tr>`).join('')
+    }</tbody></table></div>`;
+
+  const mgrs = Object.keys(L.h2h).sort();
+  const mineMgr = (L.allTime.find(r => r.team && r.team === mine) || {}).manager;
+  if (!h2hMgr || !L.h2h[h2hMgr]) h2hMgr = mineMgr || mgrs[0];
+  const opp = Object.entries(L.h2h[h2hMgr] || {}).sort((a,b) => (b[1][0]-b[1][1]) - (a[1][0]-a[1][1]));
+  html += `<h2 class="subhead">Head to head</h2>
+    <div class="controls"><label class="sr-only" for="h2h-mgr">Manager</label>
+      <select id="h2h-mgr">${mgrs.map(x => `<option${x === h2hMgr ? ' selected' : ''}>${esc(x)}</option>`).join('')}</select>
+      <span class="small">Every matchup in the spreadsheets and on ESPN, playoffs included</span></div>
+    <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="l">Opponent</th><th scope="col">Won</th><th scope="col">Lost</th><th scope="col" class="opt">Tied</th></tr></thead><tbody>${
+      opp.map(([o, r]) => `<tr><td class="l">${esc(o)}</td><td class="${r[0] > r[1] ? 'wl-w' : ''}">${r[0]}</td><td class="${r[1] > r[0] ? 'wl-l' : ''}">${r[1]}</td><td class="opt">${r[2]}</td></tr>`).join('')
+    }</tbody></table></div>`;
+  return html;
+}
+function bindHistory(){
+  const panel = document.getElementById('panel-history');
+  const redraw = () => { panel.innerHTML = renderHistory(); bindHistory(); };
+  const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('change', e => { fn(e.target.value); redraw(); }); };
+  on('hist-scope', v => histScope = v);
+  on('league-season', v => leagueSeason = v);
+  on('h2h-mgr', v => h2hMgr = v);
+  panel.querySelectorAll('.seg button[data-cat]').forEach(b => b.addEventListener('click', () => { histCat = b.dataset.cat; redraw(); }));
+}
+
 /* ---------- Model check ---------- */
 function renderCheck(){
   const C = D.check || {}, sv = C.saved || {}, cal = (C.calibration || {}).weekly || {};
@@ -848,12 +1095,13 @@ function renderStandings(){
 
 function renderAll(){
   PANELS.forEach(p => { document.getElementById(`panel-${p.id}`).innerHTML = p.render(); });
-  document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#panel-players .seg button').forEach(b => b.addEventListener('click', () => {
     playerFilter = b.dataset.filter;
     document.getElementById('panel-players').innerHTML = renderTopPlayers();
     renderAllFilters();
   }));
   bindStats();
+  bindHistory();
   renderStandings();
 }
 function renderAllFilters(){

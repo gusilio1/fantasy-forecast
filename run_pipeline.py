@@ -11,7 +11,8 @@ Runs the whole forecast end to end, in order, and stops at the first failure:
     6. weekly_matchup_simulator_v3_2.py        Monte Carlo, pickups, win probabilities
     7. season_forecast.py                      rest of season, playoff odds (optional step)
     8. model_check.py                          self-test against real results (optional step)
-    9. build_dashboard.py                      site/index.html
+    9. nba_history.py                          NBA fantasy records since 2023-24 (optional step)
+   10. build_dashboard.py                      site/index.html
 
 Optional steps print a warning if they fail and the run carries on.
 
@@ -35,6 +36,7 @@ STEPS = [   # (label, script, required)
     ("Weekly simulation", "weekly_matchup_simulator_v3_2.py", True),
     ("Season forecast", "season_forecast.py", False),
     ("Self-test", "model_check.py", False),
+    ("NBA records since 2023-24", "nba_history.py", False),
     ("Dashboard page", "build_dashboard.py", True),
 ]
 
