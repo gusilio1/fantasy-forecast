@@ -97,6 +97,19 @@ def record_snapshots(fm: pd.DataFrame, run_utc: str, corr_used: dict):
     samples.columns = [nid(c) for c in samples.columns]
     raw["fantasy_team_id"] = raw["fantasy_team_id"].map(nid)
     raw = raw.set_index("fantasy_team_id")
+    # Raw (uncorrected) rest-of-week samples with and without expected pickups.
+    rs = read(os.path.join(BASE, "weekly_matchup_v1_8_team_rest_samples.csv"))
+    ns = read(os.path.join(BASE, "weekly_matchup_v1_8_team_rest_samples_nopickups.csv"))
+    for x in (rs, ns):
+        if not x.empty:
+            x.columns = [nid(c) for c in x.columns]
+    done = {nid(r.fantasy_team_id): float(r.completed_points) for r in fm.itertuples()}
+
+    def win(frame, t, o):
+        if frame.empty or t not in frame.columns or o not in frame.columns:
+            return np.nan
+        a, b = frame[t].to_numpy(float) + done.get(t, 0), frame[o].to_numpy(float) + done.get(o, 0)
+        return float(np.mean(a > b) + 0.5 * np.mean(a == b))
     rows = []
     for r in fm.itertuples():
         t, o = nid(r.fantasy_team_id), nid(r.opponent_team_id) if pd.notna(r.opponent_team_id) else ""
@@ -114,6 +127,9 @@ def record_snapshots(fm: pd.DataFrame, run_utc: str, corr_used: dict):
             "final_p90": float(np.percentile(s, 90)),
             "win_prob": float(np.mean(s > so) + 0.5 * np.mean(s == so)) if so is not None else np.nan,
             "level_used": corr_used.get("bias", 0.0), "spread_used": corr_used.get("spread", 1.0),
+            "raw_win_prob": win(rs, t, o),
+            "nop_rest_mean": float(ns[t].mean()) if not ns.empty and t in ns.columns else np.nan,
+            "nop_win_prob": win(ns, t, o),
         })
     upsert(os.path.join(HIST, "team_snapshots.csv"), pd.DataFrame(rows), ["matchup_period", "snap_day", "team_id"])
 
@@ -218,6 +234,30 @@ def evaluate(fm: pd.DataFrame) -> dict:
                 "in_80_range": f(g["in80"].mean()),
             })
         report["weekly_by_day"] = by_day
+
+        # With vs without expected pickups (both uncorrected), on the same snapshots.
+        for c in ("raw_win_prob", "nop_rest_mean", "nop_win_prob"):
+            e[c] = pd.to_numeric(e.get(c), errors="coerce")
+        pc = e[e["nop_rest_mean"].notna() & e["raw_rest_mean"].notna()].copy()
+        if len(pc):
+            pc["err_with"] = (pc["completed_points"] + pc["raw_rest_mean"] - pc["actual"]).abs()
+            pc["err_without"] = (pc["completed_points"] + pc["nop_rest_mean"] - pc["actual"]).abs()
+            pc["bias_with"] = pc["completed_points"] + pc["raw_rest_mean"] - pc["actual"]
+            pc["bias_without"] = pc["completed_points"] + pc["nop_rest_mean"] - pc["actual"]
+            pc["brier_with"] = (pc["raw_win_prob"] - pc["outcome"]) ** 2
+            pc["brier_without"] = (pc["nop_win_prob"] - pc["outcome"]) ** 2
+            rows = []
+            for d, g in pc.groupby("snap_day"):
+                gm = g[g["opp_actual"].notna()]
+                rows.append({"day": DAY_NAMES[int(d)], "team_weeks": int(len(g)),
+                             "mae_with": f(g["err_with"].mean()), "mae_without": f(g["err_without"].mean()),
+                             "bias_with": f(g["bias_with"].mean()), "bias_without": f(g["bias_without"].mean()),
+                             "brier_with": f(gm["brier_with"].mean()), "brier_without": f(gm["brier_without"].mean())})
+            tot = {"team_weeks": int(pc[["matchup_period", "team_id"]].drop_duplicates().shape[0]),
+                   "mae_with": f(pc["err_with"].mean()), "mae_without": f(pc["err_without"].mean()),
+                   "brier_with": f(pc.loc[pc["opp_actual"].notna(), "brier_with"].mean()),
+                   "brier_without": f(pc.loc[pc["opp_actual"].notna(), "brier_without"].mean())}
+            report["pickups"] = {"by_day": rows, "overall": tot}
 
         bins = [0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.0001]
         e["bucket"] = pd.cut(e["win_prob"], bins, right=False)

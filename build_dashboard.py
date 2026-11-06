@@ -352,7 +352,17 @@ def load_payload() -> dict:
         with open(_p("run_meta.json"), encoding="utf-8") as fh:
             meta = json.load(fh)
 
+    eff = _read(_p("team_pickup_effect.csv"))
+    names_by_id = {}
+    if len(teams) and "fantasy_team_id" in teams.columns:
+        names_by_id = {_str(int(float(t))): _str(n) for t, n in zip(teams["fantasy_team_id"], teams["fantasy_team"])}
+    elif len(standings_src):
+        names_by_id = {_str(int(float(t))): _str(n) for t, n in zip(standings_src["fantasy_team_id"], standings_src["fantasy_team"])}
+    pickup_effect = {names_by_id.get(_str(int(float(r["fantasy_team_id"]))), ""): float(r["pickup_effect"])
+                     for _, r in eff.iterrows()} if len(eff) else {}
+
     team_rows = [{
+        "pickups": _num(pickup_effect.get(_str(r["fantasy_team"]))),
         "name": _str(r["fantasy_team"]),
         "final": _num(r["mean"], 0), "p10": _num(r["p10"], 0), "p90": _num(r["p90"], 0),
         "toDate": _num(r.get("actual_to_date", 0.0)),
@@ -395,8 +405,13 @@ def load_payload() -> dict:
                 "proj": _num(r["expected_fp"]), "ifPlays": _num(r["fp_if_plays"]), "play": _num(r["play_prob"], 3),
             })
     if next_day and len(tdays):
-        td = tdays[tdays["day"] == next_day].sort_values("expected_fp", ascending=False)
-        top_teams = [{"name": _str(r["fantasy_team"]), "proj": _num(r["expected_fp"])} for _, r in td.iterrows()]
+        td = tdays[tdays["day"] == next_day].copy()
+        # Current rosters only: a hypothetical pickup shouldn't count toward a day's projection.
+        col = "expected_fp_roster" if "expected_fp_roster" in td.columns else "expected_fp"
+        proj = {_str(r["fantasy_team"]): float(r[col]) for _, r in td.iterrows()}
+        for name in [t["name"] for t in team_rows]:
+            proj.setdefault(name, 0.0)          # teams with nobody playing that day
+        top_teams = [{"name": k, "proj": _num(v)} for k, v in sorted(proj.items(), key=lambda kv: -kv[1])]
 
     free_agents = [{
         "name": _str(r["player_name"]), "nba": _str(r["nba_team"]), "pos": _str(r["eligible_positions"]),
@@ -772,12 +787,13 @@ function renderMatchups(){
 function renderTeams(){
   const win = {}; D.matchups.forEach(m => { win[m.a] = m.aWin; win[m.b] = m.bWin; });
   const rows = [...D.teams].sort((a,b) => (b.final||0) - (a.final||0));
-  return `<h2>Teams</h2><p class="lede">Every team's projected weekly total, ranked.</p>
+  const hasPick = rows.some(t => t.pickups !== null && t.pickups !== undefined);
+  return `<h2>Teams</h2><p class="lede">Every team's projected weekly total, ranked. Projections assume each manager makes their usual number of pickups${hasPick ? '; the From pickups column shows how many points those expected pickups add compared with keeping the current roster' : ''}.</p>
   <div class="tablewrap"><table class="num tight"><thead><tr>
-    <th scope="col">Team</th><th scope="col">Projected</th><th scope="col" class="opt">80% range</th><th scope="col">Win chance</th>
+    <th scope="col">Team</th><th scope="col">Projected</th>${hasPick ? '<th scope="col">From pickups</th>' : ''}<th scope="col" class="opt">80% range</th><th scope="col">Win chance</th>
     <th scope="col" class="opt">Points so far</th><th scope="col" class="opt">Starts so far</th><th scope="col">PPP so far</th>
     <th scope="col" class="opt">Starts left</th><th scope="col">PPP rest of week</th></tr></thead><tbody>${
-    rows.map(t => `<tr class="${t.name===mine?'mine':''}"><td>${esc(t.name)}</td><td class="big">${fmt(t.final)}</td>
+    rows.map(t => `<tr class="${t.name===mine?'mine':''}"><td>${esc(t.name)}</td><td class="big">${fmt(t.final)}</td>${hasPick ? `<td>${t.pickups === null || t.pickups === undefined ? '–' : (Math.abs(t.pickups) < 0.5 ? '0' : signed(t.pickups, 0))}</td>` : ''}
       <td class="opt">${fmt(t.p10)} to ${fmt(t.p90)}</td><td>${pct(win[t.name])}</td><td class="opt">${fmt(t.toDate,1)}</td><td class="opt">${fmt(t.startsToDate)}</td>
       <td>${fmt(t.pppToDate,1)}</td><td class="opt">${fmt(t.startsRest,1)}</td><td>${fmt(t.pppRest,1)}</td></tr>`).join('')
   }</tbody></table></div>`;
@@ -807,7 +823,7 @@ function renderTopTeams(){
   const opp = {}; D.matchups.forEach(m => { opp[m.a] = m.b; opp[m.b] = m.a; });
   const by = Object.fromEntries(D.topTeams.map(t => [t.name, t.proj]));
   return `<h2>${esc(day(nd))}'s top teams</h2>
-    <p class="lede">Each fantasy team's projected points for ${esc(day(nd))} alone, with its best lineup and expected pickups.</p>
+    <p class="lede">Each fantasy team's projected points for ${esc(day(nd))} alone, from its current roster with its best lineup. Free agents a team might pick up aren't included.</p>
     <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="rank">#</th><th scope="col" class="l">Team</th>
       <th scope="col" class="l" style="width:40%">Projected points</th><th scope="col">Points</th><th scope="col" class="l">Opponent</th><th scope="col">Opponent points</th></tr></thead><tbody>${
       D.topTeams.map((t,i) => `<tr class="${t.name===mine?'mine':''}"><td class="rank">${i+1}</td><td class="l">${esc(t.name)}</td>
@@ -1014,6 +1030,18 @@ function renderCheck(){
         <td>${fmt(r.mean_abs_error)}</td><td>${signed(r.mean_error,0)}</td><td>${fmt(r.brier,3)}</td></tr>`).join('')
     }</tbody></table></div>`;
 
+  const PK = C.pickups;
+  if (PK && PK.overall) {
+    const o = PK.overall, better = (o.mae_with || 0) <= (o.mae_without || 0);
+    html += `<h2 class="subhead">Do expected pickups help the forecast?</h2>
+      <p class="lede">Every forecast is also run without pickups. Checked against the real results over ${fmt(o.team_weeks)} team-weeks, weekly totals were ${better ? 'closer with' : 'closer without'} expected pickups (average miss ${fmt(o.mae_with)} with, ${fmt(o.mae_without)} without).</p>
+      <div class="tablewrap"><table class="num"><thead><tr><th scope="col" class="l">Forecast made</th><th scope="col">Miss, with pickups</th><th scope="col">Miss, without</th>
+        <th scope="col" class="opt">Bias with</th><th scope="col" class="opt">Bias without</th><th scope="col">Brier with</th><th scope="col">Brier without</th></tr></thead><tbody>${
+        PK.by_day.map(r => `<tr><td class="l">${esc(day(r.day))}<span class="sub">${r.team_weeks} team-weeks</span></td>
+          <td class="${r.mae_with <= r.mae_without ? 'big' : ''}">${fmt(r.mae_with)}</td><td class="${r.mae_without < r.mae_with ? 'big' : ''}">${fmt(r.mae_without)}</td>
+          <td class="opt">${signed(r.bias_with,0)}</td><td class="opt">${signed(r.bias_without,0)}</td><td>${fmt(r.brier_with,3)}</td><td>${fmt(r.brier_without,3)}</td></tr>`).join('')
+      }</tbody></table></div><p class="note">Miss is the average gap between projected and actual weekly totals; bias is projected minus actual. Both versions here are before the learned corrections.</p>`;
+  }
   const lvl = cal.bias || 0, spr = cal.spread || 1;
   html += `<h2 class="subhead">What the forecast has learned</h2>`;
   html += cal.active

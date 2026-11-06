@@ -187,6 +187,7 @@ PUBLISH_PICKUP_ADVICE = True        # False = the public page shows expected mov
 # Self-test corrections learned from past weeks by model_check.py (history/calibration.json).
 # False = always use the raw simulation.
 USE_LEARNED_CORRECTIONS = True
+NO_PICKUP_SIMS = 500        # extra run without pickups (pickup effect on the page + self-test); 0 = off
 CALIBRATION_FILE = os.path.join(BASE, "history", "calibration.json")
 
 # Pre-game lineup values {(player_id, day): expected FP if he plays}, set from the
@@ -2417,6 +2418,7 @@ def simulate_week(
     day_fp_sum = defaultdict(float)
     day_played = defaultdict(int)
     team_day_sum = defaultdict(float)
+    team_day_roster_sum = defaultdict(float)     # same, players already on the roster only
     rng = np.random.default_rng(seed)
     id_to_team, id_to_player, team_names = fantasy_team_maps(rostered)
     fantasy_team_ids = sorted(team_names)
@@ -2510,6 +2512,7 @@ def simulate_week(
     team_rows = {str(k): np.asarray(v, dtype=int)
                  for k, v in tmpl.groupby("fantasy_team_id", dropna=False).indices.items()}
     team_order = [str(k) for k in tmpl.groupby("fantasy_team_id", dropna=False).groups.keys()]
+    start_rostered_pids = set(R_pid[R_start])
 
     def team_frame(rows, rost, on_ir, avail, ir_elig):
         f = tmpl.iloc[rows].copy()
@@ -2680,6 +2683,8 @@ def simulate_week(
                     if fantasy_team_id is not None:
                         team_scores[fantasy_team_id][sim_index] += pgame.fantasy_points
                         team_day_sum[(fantasy_team_id, day)] += pgame.fantasy_points
+                        if pid in start_rostered_pids:
+                            team_day_roster_sum[(fantasy_team_id, day)] += pgame.fantasy_points
                         if float(getattr(pgame, "minutes", 0.0) or 0.0) > 0.0:
                             team_starts[fantasy_team_id][sim_index] += 1
                         player_active_fp[pid][sim_index] += pgame.fantasy_points
@@ -2873,6 +2878,7 @@ def simulate_week(
     injury_diagnostics["day_fp_sum"] = day_fp_sum
     injury_diagnostics["day_played"] = day_played
     injury_diagnostics["team_day_sum"] = team_day_sum
+    injury_diagnostics["team_day_roster_sum"] = team_day_roster_sum
     injury_diagnostics["sims"] = sims
     return team_scores, player_active_fp, player_game_fp, player_games, team_names, id_to_player, rotation_audit, injury_diagnostics
 
@@ -2962,6 +2968,7 @@ def _merge_blocks(blocks, sizes):
     merged_diag["day_fp_sum"] = add([d["day_fp_sum"] for d in diags], float)
     merged_diag["day_played"] = add([d["day_played"] for d in diags], int)
     merged_diag["team_day_sum"] = add([d["team_day_sum"] for d in diags], float)
+    merged_diag["team_day_roster_sum"] = add([d.get("team_day_roster_sum", {}) for d in diags], float)
     merged_diag["sims"] = int(sum(sizes))
     return team_scores, pa_fp, pg_fp, player_games, team_names, id_to_player, merged_audit, merged_diag
 
@@ -3069,8 +3076,10 @@ def write_daily_outputs(diag, team_proj, merged, rostered, moves, team_names_all
         pdays = pdays[~pdays["player_id"].astype(str).str.startswith("REPL-")]   # stand-in bench players
     pdays.to_csv(output_path("player_day_projections"), index=False)
 
+    roster_sum = diag.get("team_day_roster_sum", {})
     team_rows = [{"fantasy_team_id": tid, "fantasy_team": team_names_all.get(norm_id(tid), tid), "day": day,
-                  "expected_fp": total / n} for (tid, day), total in diag["team_day_sum"].items()]
+                  "expected_fp": total / n, "expected_fp_roster": roster_sum.get((tid, day), 0.0) / n}
+                 for (tid, day), total in diag["team_day_sum"].items()]
     pd.DataFrame(team_rows).to_csv(output_path("team_day_projections"), index=False)
 
     if not pdays.empty:
@@ -3481,6 +3490,38 @@ def main():
         raw_rows.append({"fantasy_team_id": norm_id(tid), "raw_rest_mean": float(np.mean(pts)),
                          "raw_rest_sd": float(np.std(pts, ddof=1)) if len(pts) > 1 else 0.0})
     pd.DataFrame(raw_rows).to_csv(output_path("team_rest_raw"), index=False)
+    pd.DataFrame({norm_id(t): np.round(v, 2) for t, v in team_scores.items()}).to_csv(
+        output_path("team_rest_samples"), index=False)
+
+    # Same week without any pickups, so the page can show what expected pickups add and
+    # the self-test can check which version predicts real scores better.
+    effect_rows = []
+    if moves and start_day < 7 and NO_PICKUP_SIMS > 0:
+        print(f"\nComparison run without pickups: {NO_PICKUP_SIMS} simulations ...", flush=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            nop = simulate_week_parallel(
+                event_schedule=event_schedule, team_proj=team_proj, rostered=rostered, merged=merged,
+                replacement_fpg=replacement_fpg, expected_returns=expected_returns, rotations=rotations,
+                nba_status_by_pid=nba_status_by_pid, sims=NO_PICKUP_SIMS, seed=SEED + 99,
+                start_day_index=start_day, event_players=event_players, event_poss=event_poss,
+                pickup_moves=[], roster_template=build_roster_template(rostered, merged, []),
+            )[0]
+        pd.DataFrame({norm_id(t): np.round(v, 2) for t, v in nop.items()}).to_csv(
+            output_path("team_rest_samples_nopickups"), index=False)
+        movers = {norm_id(m.get("fantasy_team_id")) for m in moves}
+        for tid, pts in team_scores.items():
+            base = nop.get(tid)
+            if base is None:
+                continue
+            # Teams with no planned pickups are identical in both runs: their difference is noise.
+            effect = float(np.mean(pts) - np.mean(base)) if norm_id(tid) in movers else 0.0
+            effect_rows.append({"fantasy_team_id": norm_id(tid), "with_pickups": float(np.mean(pts)),
+                                "without_pickups": float(np.mean(base)), "pickup_effect": effect})
+        print("Expected pickups add (rest of week): " + ", ".join(
+            f"{team_names_all.get(r['fantasy_team_id'], r['fantasy_team_id']).strip()} {r['pickup_effect']:+.0f}"
+            for r in sorted(effect_rows, key=lambda r: -r["pickup_effect"])))
+    pd.DataFrame(effect_rows, columns=["fantasy_team_id", "with_pickups", "without_pickups", "pickup_effect"]).to_csv(
+        output_path("team_pickup_effect"), index=False)
 
     # Learned corrections (self-test): scale the level and the spread of the
     # simulated remaining points. Finished days are actual points and never change.
