@@ -1,0 +1,61 @@
+matchup_period,snap_day,fantasy_team_id,fantasy_team,playoff_prob,title_prob,proj_wins,mean_finish
+3,0,7,The new look Framptons,0.9062,0.2036,12.13,3.11
+3,0,8,Da Champ,0.9045,0.2035,11.96,3.27
+3,0,6,Scoot N Shoot,0.8523,0.1684,11.63,3.72
+3,0,11,PBNOJ,0.8563,0.1444,11.2,3.86
+3,0,14,Daniel's Dangerous Team,0.6067,0.0611,9.87,5.8
+3,0,5,YOUNG ANTS,0.5104,0.0876,9.02,6.44
+3,0,12,trembanyama ,0.3841,0.0394,8.3,7.3
+3,0,1,Gustavo Giants ,0.3356,0.0656,7.92,7.61
+3,0,9,Bez Mbengers and Mash,0.3105,0.0085,8.0,7.76
+3,0,13,spida man,0.2365,0.012,7.49,8.37
+3,0,3,The Big KAT-astrophy,0.0648,0.0052,5.72,10.01
+3,0,4,Souv's malakas,0.0321,0.0007,4.75,10.75
+3,1,7,The new look Framptons,0.9545,0.2653,12.88,2.48
+3,1,8,Da Champ,0.9194,0.205,12.06,3.18
+3,1,6,Scoot N Shoot,0.8691,0.1681,11.62,3.69
+3,1,11,PBNOJ,0.8267,0.1131,10.87,4.2
+3,1,14,Daniel's Dangerous Team,0.563,0.0506,9.53,6.14
+3,1,12,trembanyama ,0.5049,0.0519,8.98,6.54
+3,1,5,YOUNG ANTS,0.4557,0.0685,8.67,6.84
+3,1,1,Gustavo Giants ,0.334,0.0565,7.87,7.63
+3,1,13,spida man,0.259,0.012,7.69,8.16
+3,1,9,Bez Mbengers and Mash,0.2017,0.0038,7.3,8.53
+3,1,3,The Big KAT-astrophy,0.0876,0.0046,6.04,9.67
+3,1,4,Souv's malakas,0.0244,0.0006,4.47,10.94
+3,3,7,The new look Framptons,0.9829,0.3036,13.96,1.88
+3,3,14,Daniel's Dangerous Team,0.9344,0.2477,12.35,3.24
+3,3,8,Da Champ,0.8518,0.1441,11.14,4.12
+3,3,6,Scoot N Shoot,0.8042,0.094,10.94,4.46
+3,3,11,PBNOJ,0.8009,0.087,10.67,4.57
+3,3,9,Bez Mbengers and Mash,0.4658,0.0104,8.77,6.76
+3,3,12,trembanyama ,0.3701,0.0234,8.16,7.41
+3,3,5,YOUNG ANTS,0.3331,0.0423,7.99,7.53
+3,3,1,Gustavo Giants ,0.2527,0.037,7.41,8.08
+3,3,3,The Big KAT-astrophy,0.0851,0.0067,5.9,9.59
+3,3,13,spida man,0.0961,0.0036,6.16,9.6
+3,3,4,Souv's malakas,0.0229,0.0002,4.54,10.76
+3,4,7,The new look Framptons,0.9925,0.3274,14.46,1.61
+3,4,8,Da Champ,0.9763,0.3134,13.02,2.44
+3,4,6,Scoot N Shoot,0.7395,0.0715,10.29,4.94
+3,4,11,PBNOJ,0.7543,0.0703,10.09,4.98
+3,4,14,Daniel's Dangerous Team,0.5973,0.0404,9.57,5.97
+3,4,5,YOUNG ANTS,0.5706,0.0835,9.14,6.19
+3,4,1,Gustavo Giants ,0.3795,0.061,7.96,7.39
+3,4,12,trembanyama ,0.2854,0.0153,7.42,8.11
+3,4,9,Bez Mbengers and Mash,0.2712,0.0026,7.5,8.12
+3,4,13,spida man,0.2627,0.0082,7.47,8.28
+3,4,4,Souv's malakas,0.1363,0.0048,6.14,9.39
+3,4,3,The Big KAT-astrophy,0.0344,0.0016,4.92,10.57
+3,5,7,The new look Framptons,0.992,0.3342,14.46,1.59
+3,5,8,Da Champ,0.9706,0.3037,12.93,2.48
+3,5,14,Daniel's Dangerous Team,0.7493,0.0763,10.47,4.95
+3,5,6,Scoot N Shoot,0.6811,0.0717,9.81,5.37
+3,5,11,PBNOJ,0.6206,0.0506,9.3,5.86
+3,5,5,YOUNG ANTS,0.3904,0.0498,8.09,7.34
+3,5,9,Bez Mbengers and Mash,0.3852,0.0085,8.18,7.4
+3,5,12,trembanyama ,0.3695,0.0261,7.87,7.62
+3,5,1,Gustavo Giants ,0.3209,0.0538,7.54,7.85
+3,5,13,spida man,0.3211,0.0153,7.89,7.85
+3,5,4,Souv's malakas,0.1235,0.0052,5.92,9.64
+3,5,3,The Big KAT-astrophy,0.0758,0.0048,5.54,10.06

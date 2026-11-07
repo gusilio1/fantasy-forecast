@@ -1,0 +1,15 @@
+{
+ "weekly": {
+  "active": false,
+  "bias": 0.0,
+  "spread": 1.0,
+  "team_weeks": 0,
+  "reason": "no finished weeks checked yet"
+ },
+ "season": {
+  "active": false,
+  "spread": 1.0,
+  "reason": "no forecast weeks finished yet"
+ },
+ "updated_utc": "2026-11-07T16:32:07.214155+00:00"
+}
