@@ -107,7 +107,9 @@ def league_stats(standings_src: pd.DataFrame) -> dict:
     for tid, g in td.groupby("fantasy_team_id"):
         tw, tw_st = ppp(g[g["matchup_period"] == cur])
         lw, lw_st = ppp(g[g["matchup_period"] == cur - 1])
-        l3, l3_st = ppp(g[g["matchup_period"].between(cur - 2, cur)])
+        # Before this week's first game, "last 3 weeks" means the 3 finished weeks before it.
+        l3_end = cur if tw_st > 0 else cur - 1
+        l3, l3_st = ppp(g[g["matchup_period"].between(l3_end - 2, l3_end)])
         se, se_st = ppp(g)
         rows.append({"team": name.get(tid, str(tid)), "manager": mgr.get(tid, ""),
                      "week": _num(tw), "weekStarts": tw_st, "lastWeek": _num(lw), "lastWeekStarts": lw_st,
@@ -1097,7 +1099,7 @@ function renderStats(){
   const preWeek = S.ppp.every(r => !r.weekStarts) && S.ppp.some(r => r.lastWeekStarts);
   const wk = preWeek ? 'lastWeek' : 'week';
   let html = `<h2>Points per player</h2>
-    <p class="lede">Fantasy points divided by games played by players in the active lineup, from ESPN's actual scores. "Last 3 weeks" includes this week so far.${preWeek ? " This week's games haven't started yet, so the first column shows last week." : ''}</p>
+    <p class="lede">Fantasy points divided by games played by players in the active lineup, from ESPN's actual scores. ${preWeek ? '' : '"Last 3 weeks" includes this week so far.'}${preWeek ? " This week's games haven't started yet, so the first column shows last week and \"Last 3 weeks\" is the three weeks before this one." : ''}</p>
     <div class="tablewrap"><table class="num tight" id="ppp-table"><thead><tr>${th('name','Manager')}${th(wk, preWeek ? 'Last week' : 'This week')}${th('last3','Last 3 weeks')}${th('season','Season')}</tr></thead><tbody>${
       rows.map(r => `<tr class="${r.team===mine?'mine':''}"><td class="l wrapcell">${who(r.team, r.manager)}</td>
         ${cell(r[wk], r[wk + 'Starts'], wk)}${cell(r.last3, r.last3Starts, 'last3')}${cell(r.season, r.seasonStarts, 'season')}</tr>`).join('')
