@@ -106,10 +106,12 @@ def league_stats(standings_src: pd.DataFrame) -> dict:
     rows = []
     for tid, g in td.groupby("fantasy_team_id"):
         tw, tw_st = ppp(g[g["matchup_period"] == cur])
+        lw, lw_st = ppp(g[g["matchup_period"] == cur - 1])
         l3, l3_st = ppp(g[g["matchup_period"].between(cur - 2, cur)])
         se, se_st = ppp(g)
         rows.append({"team": name.get(tid, str(tid)), "manager": mgr.get(tid, ""),
-                     "week": _num(tw), "weekStarts": tw_st, "last3": _num(l3), "last3Starts": l3_st,
+                     "week": _num(tw), "weekStarts": tw_st, "lastWeek": _num(lw), "lastWeekStarts": lw_st,
+                     "last3": _num(l3), "last3Starts": l3_st,
                      "season": _num(se), "seasonStarts": se_st})
 
     who = lambda tid: {"team": name.get(tid, str(tid)), "manager": mgr.get(tid, "")}
@@ -452,6 +454,9 @@ def load_payload() -> dict:
     if len(standings_src) and "manager" in standings_src.columns:
         managers = {_str(r["fantasy_team"]): _str(r["manager"]) for _, r in standings_src.iterrows()}
 
+    last_week_ppp = {r["team"]: r.get("lastWeek") for r in (stats.get("ppp") or [])}
+    for t in team_rows:
+        t["pppLastWeek"] = last_week_ppp.get(t["name"])
     season, check = season_payload(managers), check_payload()
     by_name = {r["name"]: r for r in (season.get("teams") or [])}
     for st in standings:
@@ -665,6 +670,9 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 const fmt = (v, d=0) => (v === null || v === undefined || Number.isNaN(v)) ? '–'
   : Number(v).toLocaleString('en-AU', {minimumFractionDigits:d, maximumFractionDigits:d});
 const pct = v => (v === null || v === undefined) ? '–' : v >= .995 ? '>99%' : v < .005 ? '<1%' : Math.round(v*100) + '%';
+// Before a team's first game of the week, show last week's PPP instead of nothing.
+const pppNow = t => (t && t.startsToDate > 0) ? {v: t.pppToDate, last: false}
+                                              : {v: t ? t.pppLastWeek : null, last: !!(t && t.pppLastWeek !== null && t.pppLastWeek !== undefined)};
 const signed = (v, d=1) => (v === null || v === undefined) ? '–' : (v > 0 ? '+' : v < 0 ? '−' : '') + fmt(Math.abs(v), d);
 const STATUS = {ACTIVE:'', OUT:'Out', DAY_TO_DAY:'Day-to-day', QUESTIONABLE:'Questionable', DOUBTFUL:'Doubtful',
                 PROBABLE:'Probable', SUSPENSION:'Suspended', SUSPENDED:'Suspended', INJURY_RESERVE:'Injured reserve'};
@@ -771,7 +779,8 @@ function renderMatchups(){
       <div class="facts num">
         <span class="v">${fmt(ta.toDate,1)}</span><span class="k">Points so far</span><span class="v r">${fmt(tb.toDate,1)}</span>
         <span class="v">${fmt(ta.final)}</span><span class="k">Projected final</span><span class="v r">${fmt(tb.final)}</span>
-        <span class="v">${fmt(ta.pppToDate,1)}</span><span class="k">PPP so far</span><span class="v r">${fmt(tb.pppToDate,1)}</span>
+        ${(() => { const pa = pppNow(ta), pb = pppNow(tb), last = pa.last && pb.last;
+          return `<span class="v">${fmt(pa.v,1)}</span><span class="k">${last ? 'PPP last week' : 'PPP so far'}</span><span class="v r">${fmt(pb.v,1)}</span>`; })()}
         <span class="v">${fmt(ta.pppRest,1)}</span><span class="k">PPP rest of week</span><span class="v r">${fmt(tb.pppRest,1)}</span>
       </div>
       <p class="verdict">${weekDone
@@ -795,7 +804,7 @@ function renderTeams(){
     <th scope="col" class="opt">Starts left</th><th scope="col">PPP rest of week</th></tr></thead><tbody>${
     rows.map(t => `<tr class="${t.name===mine?'mine':''}"><td>${esc(t.name)}</td><td class="big">${fmt(t.final)}</td>${hasPick ? `<td>${t.pickups === null || t.pickups === undefined ? '–' : (Math.abs(t.pickups) < 0.5 ? '0' : signed(t.pickups, 0))}</td>` : ''}
       <td class="opt">${fmt(t.p10)} to ${fmt(t.p90)}</td><td>${pct(win[t.name])}</td><td class="opt">${fmt(t.toDate,1)}</td><td class="opt">${fmt(t.startsToDate)}</td>
-      <td>${fmt(t.pppToDate,1)}</td><td class="opt">${fmt(t.startsRest,1)}</td><td>${fmt(t.pppRest,1)}</td></tr>`).join('')
+      <td>${(() => { const p = pppNow(t); return p.last ? `${fmt(p.v,1)}<span class="sub">last wk</span>` : fmt(p.v,1); })()}</td><td class="opt">${fmt(t.startsRest,1)}</td><td>${fmt(t.pppRest,1)}</td></tr>`).join('')
   }</tbody></table></div>`;
 }
 
@@ -1085,11 +1094,13 @@ function renderStats(){
       aria-sort="${pppSort.key===k ? (pppSort.dir < 0 ? 'descending' : 'ascending') : 'none'}">${label}</th>`;
   const best = k => Math.max(...S.ppp.map(r => r[k] ?? -Infinity));
   const cell = (v, n, k) => `<td class="${v !== null && v === best(k) ? 'big' : ''}">${fmt(v,1)}<span class="sub opt">${n} starts</span></td>`;
+  const preWeek = S.ppp.every(r => !r.weekStarts) && S.ppp.some(r => r.lastWeekStarts);
+  const wk = preWeek ? 'lastWeek' : 'week';
   let html = `<h2>Points per player</h2>
-    <p class="lede">Fantasy points divided by games played by players in the active lineup, from ESPN's actual scores. "Last 3 weeks" includes this week so far.</p>
-    <div class="tablewrap"><table class="num tight" id="ppp-table"><thead><tr>${th('name','Manager')}${th('week','This week')}${th('last3','Last 3 weeks')}${th('season','Season')}</tr></thead><tbody>${
+    <p class="lede">Fantasy points divided by games played by players in the active lineup, from ESPN's actual scores. "Last 3 weeks" includes this week so far.${preWeek ? " This week's games haven't started yet, so the first column shows last week." : ''}</p>
+    <div class="tablewrap"><table class="num tight" id="ppp-table"><thead><tr>${th('name','Manager')}${th(wk, preWeek ? 'Last week' : 'This week')}${th('last3','Last 3 weeks')}${th('season','Season')}</tr></thead><tbody>${
       rows.map(r => `<tr class="${r.team===mine?'mine':''}"><td class="l wrapcell">${who(r.team, r.manager)}</td>
-        ${cell(r.week, r.weekStarts, 'week')}${cell(r.last3, r.last3Starts, 'last3')}${cell(r.season, r.seasonStarts, 'season')}</tr>`).join('')
+        ${cell(r[wk], r[wk + 'Starts'], wk)}${cell(r.last3, r.last3Starts, 'last3')}${cell(r.season, r.seasonStarts, 'season')}</tr>`).join('')
     }</tbody></table></div>
     <p class="note">The best value in each column is in bold. Click a column heading to sort.</p>`;
   const recs = S.records || [];
