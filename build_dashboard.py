@@ -341,6 +341,75 @@ def check_payload() -> dict:
     return rep
 
 
+def daily_payload(teams: pd.DataFrame, tdays: pd.DataFrame, pdays: pd.DataFrame, meta: dict) -> dict:
+    """
+    Day-by-day path of each team's weekly total, for the matchup chart.
+        finished days   ESPN's actual points (league_team_days.csv) and actual starts
+        remaining days  the simulator's mean points per day (team_day_projections, pickups
+                        included, so the path ends at the projected final) and the
+                        expected number of rostered players who play
+    The 80% band widens with the points still to come: at each day it is the weekly
+    p10-p90 spread scaled by sqrt(projected points so far / projected points left at the
+    start of the remaining days), so it ends exactly at the weekly 80% range.
+    """
+    week_dates = meta.get("week_dates") or {}
+    if not week_dates or teams.empty:
+        return {}
+    days = list(week_dates)
+    finished = set(meta.get("finished_days") or [])
+    td = _read(os.path.join(BASE, "league_team_days.csv"))
+    actual = {}
+    if len(td):
+        for _, r in td.iterrows():
+            actual[(_str(int(float(r["fantasy_team_id"]))), _str(r["date"]))] = (
+                float(r["espn_points"]), _num(r.get("starts"), 0))
+    proj = {}
+    if len(tdays):
+        for _, r in tdays.iterrows():
+            proj[(_str(int(float(r["fantasy_team_id"]))), _str(r["day"]))] = float(r["expected_fp"])
+    playing = {}
+    if len(pdays) and "play_prob" in pdays:
+        ros = pdays[pdays["fantasy_status"] == "ROSTERED"].assign(
+            fantasy_team=lambda f: f["fantasy_team"].astype(str).str.strip())
+        playing = ros.groupby(["fantasy_team", "day"])["play_prob"].sum().to_dict()
+
+    out = {}
+    for _, r in teams.iterrows():
+        tid, name = _str(int(float(r["fantasy_team_id"]))), _str(r["fantasy_team"])
+        to_date = float(r.get("actual_to_date") or 0.0)
+        pts, kind, players = [], [], []
+        for d in days:
+            if d in finished:
+                a = actual.get((tid, week_dates[d]))
+                pts.append(a[0] if a else None)
+                players.append(a[1] if a else None)
+                kind.append("final")
+            else:
+                pts.append(proj.get((tid, d), 0.0))
+                players.append(_num(playing.get((name, d), 0.0), 1))
+                kind.append("proj")
+        # Finished days missing from the day file: spread ESPN's total so the path still adds up.
+        known = sum(p for p, k in zip(pts, kind) if k == "final" and p is not None)
+        missing = [i for i, (p, k) in enumerate(zip(pts, kind)) if k == "final" and p is None]
+        for i in missing:
+            pts[i] = (to_date - known) / len(missing)
+        cum, lo, hi, run = [], [], [], 0.0
+        rest_total = sum(p for p, k in zip(pts, kind) if k == "proj")
+        mean, p10, p90 = float(r["mean"]), float(r["p10"]), float(r["p90"])
+        run_rest = 0.0
+        for p, k in zip(pts, kind):
+            run += p
+            if k == "proj":
+                run_rest += p
+            f = math.sqrt(run_rest / rest_total) if rest_total > 0 else 0.0
+            cum.append(round(run, 1))
+            lo.append(round(run - (mean - p10) * f, 1))
+            hi.append(round(run + (p90 - mean) * f, 1))
+        out[name] = {"pts": [round(p, 1) for p in pts], "cum": cum, "lo": lo, "hi": hi, "players": players}
+    return {"days": days, "dates": [week_dates[d] for d in days],
+            "final": [d in finished for d in days], "teams": out}
+
+
 def load_payload() -> dict:
     teams = _read(_p("team_summary.csv"))
     players = _read(_p("player_summary.csv"))
@@ -474,6 +543,7 @@ def load_payload() -> dict:
         "season": season, "check": check,
         "history": history,
         "title": LEAGUE_TITLE, "meta": meta, "dayFull": DAY_FULL, "stats": stats, "managers": managers,
+        "daily": daily_payload(teams, tdays, pdays, meta),
         "teams": team_rows, "matchups": matchups, "rosters": rosters, "standings": standings,
         "topPlayers": top_players, "topTeams": top_teams, "freeAgents": free_agents,
         "plan": moves(plan), "advice": moves(advice) if len(advice) else [],
@@ -553,6 +623,56 @@ h2{margin:0 0 4px;font-weight:700;font-stretch:110%;font-size:1.35rem;line-heigh
 .facts .r{text-align:right}
 .verdict{margin:12px 0 0;padding-top:10px;border-top:1px solid var(--line);color:var(--muted);font-size:.9rem}
 .verdict b{color:var(--ink);font-weight:600}
+
+/* Day-by-day matchup chart */
+.daily{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px 18px 12px;margin:0 0 16px}
+.dhead{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px 20px;align-items:flex-start}
+.kicker{margin:0;color:var(--muted);font-weight:700;font-size:.74rem;letter-spacing:.12em;text-transform:uppercase}
+.dbig{margin:2px 0 0;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.dbig .n{font-weight:800;font-stretch:118%;font-size:clamp(2.6rem,9vw,3.6rem);line-height:1;letter-spacing:-.02em}
+.dbig .by{color:var(--muted);font-weight:700;font-size:.8rem;letter-spacing:.1em;text-transform:uppercase}
+.dsub{margin:6px 0 0;color:var(--muted)}
+.dsub b{color:var(--ink);font-weight:700}
+.dsub .lead-bad{color:var(--bad)} .dsub .lead-good{color:var(--good)}
+.dpick{display:flex;flex-direction:column;gap:4px;font-size:.8rem;color:var(--muted);min-width:0;max-width:100%}
+.dpick select{font:600 .9rem var(--font);color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:7px 10px;max-width:100%}
+.dkey{display:flex;flex-wrap:wrap;gap:6px 16px;margin:14px 0 6px;font-size:.85rem;color:var(--muted)}
+.dkey span{display:inline-flex;align-items:center;gap:6px}
+.dkey i{display:inline-block;width:18px;height:3px;border-radius:2px}
+.dkey i.ka{background:var(--a)} .dkey i.kb{background:var(--b)}
+.dkey i.kp{background:none;border-top:2px dashed var(--muted);height:0}
+.dkey i.kr{background:var(--chip);height:10px;width:14px;border-radius:2px}
+.dchart{position:relative;height:260px;margin:4px 14px 0 40px}
+@media (min-width:760px){.dchart{height:300px}}
+.dchart svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.dchart .past{fill:var(--row)}
+.dchart .grid line{stroke:var(--line);stroke-width:1}
+.dchart .band-a{fill:var(--a);opacity:.13} .dchart .band-b{fill:var(--b);opacity:.18}
+.dchart .ln{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}
+.dchart .ln.a{stroke:var(--a)} .dchart .ln.b{stroke:var(--b)}
+.dchart .ln.proj{stroke-dasharray:6 5;stroke-width:2.5}
+.dchart .today{stroke:var(--muted);stroke-width:1;stroke-dasharray:3 3}
+.dchart .selline{stroke:var(--ink);stroke-width:1;opacity:.35}
+.dchart .ylab{position:absolute;left:-44px;width:38px;text-align:right;font-size:.75rem;color:var(--muted);transform:translateY(-50%)}
+.dchart .tlab{position:absolute;top:4px;font-size:.68rem;font-weight:700;letter-spacing:.12em;color:var(--muted);padding-left:6px;text-transform:uppercase}
+.dchart .dot{position:absolute;width:10px;height:10px;border-radius:50%;transform:translate(-50%,-50%);border:2px solid var(--surface);pointer-events:none}
+.dchart .dot.a{background:var(--a)} .dchart .dot.b{background:var(--b)}
+.dchart .dot.sel{width:16px;height:16px;border:3px solid var(--ink)}
+.dchart .dot.proj{background:var(--surface);border-width:2px}
+.dchart .dot.proj.a{border-color:var(--a)} .dchart .dot.proj.b{border-color:var(--b)}
+.dchart .dot.proj.sel{border-width:3px}
+.dchart .hit{position:absolute;top:0;bottom:0;appearance:none;background:transparent;border:0;padding:0;cursor:pointer;border-radius:6px}
+.dchart .hit:hover{background:color-mix(in srgb,var(--ink) 4%,transparent)}
+.dchart .hit:focus-visible{outline:2px solid var(--a);outline-offset:-2px}
+.dx{position:relative;height:22px;margin:6px 14px 0 40px}
+.dx span{position:absolute;transform:translateX(-50%);font-size:.74rem;font-weight:700;letter-spacing:.08em;color:var(--muted);text-transform:uppercase}
+.dx span.on{color:var(--ink)}
+.daily details{margin-top:8px;border-top:1px solid var(--line);padding-top:8px}
+.daily summary{cursor:pointer;color:var(--muted);font-size:.88rem;font-weight:600}
+.daily details table{margin-top:8px}
+.daily td.proj{color:var(--muted);font-style:italic}
+.daily tr.on td{background:var(--a-soft)}
+.daybtn{appearance:none;background:none;border:0;padding:0;margin:8px 0 0;font:600 .86rem var(--font);color:var(--a);cursor:pointer;text-decoration:underline;text-underline-offset:3px}
 
 /* Tables */
 .tablewrap{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:10px}
@@ -707,7 +827,7 @@ function header(){
     const o = document.createElement('option'); o.value = n; o.textContent = n; sel.appendChild(o);
   });
   sel.value = mine;
-  sel.addEventListener('change', () => { mine = sel.value; try { localStorage.setItem('myTeam', mine); } catch (e) {} renderAll(); });
+  sel.addEventListener('change', () => { mine = sel.value; dailyMatch = null; try { localStorage.setItem('myTeam', mine); } catch (e) {} renderAll(); });
 }
 
 /* ---------- Panels ---------- */
@@ -761,6 +881,115 @@ function select(id, remember){
   if (remember) { try { localStorage.setItem('tab', id); } catch (e) {} }
 }
 
+
+/* ---------- Day-by-day chart ---------- */
+let dailyMatch = null, dailyDay = null;
+function dailyState(){
+  const W = D.daily || {};
+  if (!W.days || !D.matchups.length) return null;
+  if (dailyMatch === null || !D.matchups[dailyMatch]) {
+    const i = D.matchups.findIndex(m => m.a === mine || m.b === mine);
+    dailyMatch = i >= 0 ? i : 0;
+  }
+  if (dailyDay === null) {
+    const k = W.final.indexOf(false);
+    dailyDay = k >= 0 ? k : W.days.length - 1;
+  }
+  return W;
+}
+const dayMonth = iso => {
+  const [y, mo, d] = String(iso).split('-').map(Number);
+  if (!y) return '';
+  return `${d} ${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][mo-1]}`;
+};
+function renderDaily(){
+  const W = dailyState();
+  if (!W) return '';
+  const m = D.matchups[dailyMatch];
+  const A = W.teams[m.a], B = W.teams[m.b];
+  if (!A || !B) return '';
+  const n = W.days.length, k = dailyDay, isFinal = W.final[k];
+  const focusB = m.b === mine;
+  const F = focusB ? B : A, O = focusB ? A : B, fName = focusB ? m.b : m.a, oName = focusB ? m.a : m.b;
+  const nFinal = W.final.filter(Boolean).length;
+  const lead = F.cum[k] - O.cum[k];
+  const leadTxt = Math.abs(lead) < 0.5 ? `Level with` :
+    `<b class="${lead < 0 ? 'lead-bad' : 'lead-good'}">${fmt(Math.abs(lead))}</b> ${lead < 0 ? 'behind' : 'ahead of'}`;
+  const tonight = !isFinal && k === nFinal;
+  const pl = (x) => x === null || x === undefined ? '–' : fmt(x);
+  const playersTxt = isFinal ? `${pl(F.players[k])} v ${pl(O.players[k])} starts that day`
+    : `about ${pl(F.players[k])} v ${pl(O.players[k])} players ${tonight ? 'playing tonight' : 'playing that day'}`;
+
+  // Scales: x by day end (0 = start of week), y from 0 to the top of the 80% bands.
+  const top = Math.max(...A.hi, ...B.hi, ...A.cum, ...B.cum, 1) * 1.04;
+  const step = top > 1500 ? 500 : top > 600 ? 250 : 100;
+  const X = i => i / n * 100, Y = v => 100 - Math.max(0, v) / top * 100;
+  const pts = (T, from, to, key='cum') => { const o = []; for (let i = from; i <= to; i++) o.push([X(i), Y(i === 0 ? 0 : T[key][i-1])]); return o; };
+  const path = p => p.map((q, i) => `${i ? 'L' : 'M'}${q[0].toFixed(2)} ${q[1].toFixed(2)}`).join(' ');
+  const band = (T) => {
+    if (nFinal >= n) return '';
+    const up = [], dn = [];
+    for (let i = nFinal; i <= n; i++) {
+      const base = i === 0 ? 0 : T.cum[i-1];
+      up.push([X(i), Y(i === 0 ? 0 : (i <= nFinal ? base : T.hi[i-1]))]);
+      dn.push([X(i), Y(i === 0 ? 0 : (i <= nFinal ? base : T.lo[i-1]))]);
+    }
+    return path(up.concat(dn.reverse())) + ' Z';
+  };
+  const lines = (T, cls) => `${nFinal > 0 ? `<path class="ln ${cls}" vector-effect="non-scaling-stroke" d="${path(pts(T, 0, nFinal))}"/>` : ''}
+    ${nFinal < n ? `<path class="ln proj ${cls}" vector-effect="non-scaling-stroke" d="${path(pts(T, nFinal, n))}"/>` : ''}`;
+  const ticks = []; for (let v = step; v < top; v += step) ticks.push(v);
+  const svg = `<svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+      ${nFinal > 0 ? `<rect class="past" x="0" y="0" width="${X(nFinal)}" height="100"/>` : ''}
+      <g class="grid">${ticks.map(v => `<line vector-effect="non-scaling-stroke" x1="0" x2="100" y1="${Y(v)}" y2="${Y(v)}"/>`).join('')}
+        <line vector-effect="non-scaling-stroke" x1="0" x2="100" y1="100" y2="100"/></g>
+      <path class="band-a" d="${band(A)}"/><path class="band-b" d="${band(B)}"/>
+      ${nFinal > 0 && nFinal < n ? `<line class="today" vector-effect="non-scaling-stroke" x1="${X(nFinal)}" x2="${X(nFinal)}" y1="0" y2="100"/>` : ''}
+      <line class="selline" vector-effect="non-scaling-stroke" x1="${X(k+1)}" x2="${X(k+1)}" y1="0" y2="100"/>
+      ${lines(A, 'a')}${lines(B, 'b')}
+    </svg>`;
+  const dots = (T, cls) => T.cum.map((v, i) => `<span class="dot ${cls}${W.final[i] ? '' : ' proj'}${i === k ? ' sel' : ''}" style="left:${X(i+1)}%;top:${Y(v)}%"></span>`).join('');
+  const hits = W.days.map((d, i) => `<button type="button" class="hit" data-dday="${i}" aria-pressed="${i===k}"
+      style="left:${X(i)}%;width:${100/n}%" aria-label="${esc(day(d))}: ${esc(m.a)} ${fmt(A.cum[i])}, ${esc(m.b)} ${fmt(B.cum[i])}${W.final[i] ? '' : ' projected'}"></button>`).join('');
+  const label = nFinal > 0 && nFinal < n ? `<span class="tlab" style="left:${X(nFinal)}%">${nFinal === n ? '' : 'Today'}</span>` : '';
+  const opts = D.matchups.map((x, i) => `<option value="${i}"${i === dailyMatch ? ' selected' : ''}>${esc(x.a)} v ${esc(x.b)}</option>`).join('');
+  const rows = W.days.map((d, i) => `<tr class="${i===k?'on':''}"><td class="l">${esc(day(d).slice(0,3))} ${esc(dayMonth(W.dates[i]))}</td>
+      <td class="${W.final[i]?'':'proj'}">${fmt(A.pts[i],1)}</td><td class="${W.final[i]?'':'proj'}">${fmt(B.pts[i],1)}</td>
+      <td>${fmt(A.cum[i])} – ${fmt(B.cum[i])}</td></tr>`).join('');
+
+  return `<section class="daily" id="daily" aria-label="Day by day projection">
+    <div class="dhead">
+      <div>
+        <p class="kicker">Week ${esc((D.meta||{}).matchup_period ?? '')} · ${esc(day(W.days[k]).slice(0,3))} ${esc(dayMonth(W.dates[k]))} · ${isFinal ? 'Final' : 'Projected'}</p>
+        <p class="dbig"><span class="n num" style="color:${focusB ? 'var(--ink)' : 'var(--ink)'}">${fmt(F.cum[k])}</span><span class="by">${k === n-1 ? (isFinal ? 'final' : 'projected final') : `after ${esc(day(W.days[k]))}`}</span></p>
+        <p class="dsub">${esc(fName)} · ${leadTxt} <b>${esc(oName)}</b> <span class="num">${fmt(O.cum[k])}</span> · ${playersTxt}</p>
+      </div>
+      <label class="dpick">Matchup<select id="daily-pick">${opts}</select></label>
+    </div>
+    <div class="dkey"><span><i class="ka"></i>${esc(m.a)}</span><span><i class="kb"></i>${esc(m.b)}</span>
+      ${nFinal < n ? `<span><i class="kp"></i>Projected</span><span><i class="kr" style="background:color-mix(in srgb,var(--a) 20%,transparent)"></i>80% range</span>` : ''}</div>
+    <div class="dchart">${svg}${ticks.map(v => `<span class="ylab num" style="top:${Y(v)}%">${fmt(v)}</span>`).join('')}
+      ${label}${dots(A,'a')}${dots(B,'b')}${hits}</div>
+    <div class="dx">${W.days.map((d, i) => `<span class="${i===k?'on':''}" style="left:${X(i+1)}%">${esc(d)}</span>`).join('')}</div>
+    <details><summary>Points each day</summary>
+      <div class="tablewrap"><table class="num tight"><thead><tr><th scope="col" class="l">Day</th><th scope="col">${esc(m.a)}</th><th scope="col">${esc(m.b)}</th><th scope="col">Running total</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <p class="note">Finished days are ESPN's actual scores; the rest (in italics) are the simulation's average, including expected pickups, so the line ends at the projected final. The shaded band is an 80% range that widens as more games are still to be played.</p>
+    </details>
+  </section>`;
+}
+function bindDaily(){
+  const el = document.getElementById('daily');
+  if (!el) return;
+  const redraw = (keepFocus) => {
+    const open = el.querySelector('details')?.open;
+    el.outerHTML = renderDaily();
+    if (open) document.querySelector('#daily details').open = true;
+    bindDaily();
+    if (keepFocus !== undefined) document.querySelector(`#daily [data-dday="${keepFocus}"]`)?.focus();
+  };
+  el.querySelectorAll('[data-dday]').forEach(b => b.addEventListener('click', () => { dailyDay = +b.dataset.dday; redraw(dailyDay); }));
+  el.querySelector('#daily-pick')?.addEventListener('change', e => { dailyMatch = +e.target.value; redraw(); });
+}
 function renderMatchups(){
   if (!D.matchups.length) return `<h2>Matchups</h2><p class="empty">Matchups appear after the ESPN matchup download runs this week.</p>`;
   const weekDone = !((D.meta || {}).simulated_days || []).length;
@@ -788,9 +1017,11 @@ function renderMatchups(){
       <p class="verdict">${weekDone
         ? (Math.abs(m.margin || 0) < 0.05 ? `<b>Tied</b> at ${fmt(ta.toDate,1)}.` : `<b>${esc(fav)} won</b> by ${fmt(Math.abs(m.margin || 0),1)} points.`)
         : `<b>${esc(fav)} ${pct(Math.max(aw,bw))} to win</b>, by about ${fmt(Math.abs(m.margin || 0))} points. In 80% of simulations they finish between ${side(lo)} and ${side(hi)}.`}</p>
+      ${(D.daily || {}).days ? `<button type="button" class="daybtn" data-dmatch="${D.matchups.indexOf(m)}">Day by day</button>` : ''}
     </article>`;
   };
   return `<h2>Matchups</h2><p class="lede">${weekDone ? "This week is complete: these are ESPN's final scores. The next week's forecast starts once ESPN moves to the new week." : "Win chance is the share of simulations each team finished ahead. Finished days use ESPN's actual scores."}</p>
+    ${renderDaily()}
     <div class="grid">${ms.map(card).join('')}</div>
     <p class="note">PPP is points per player: fantasy points divided by games played by players in the active lineup.</p>`;
 }
@@ -1157,6 +1388,12 @@ function renderAll(){
   }));
   bindStats();
   bindHistory();
+  bindDaily();
+  document.querySelectorAll('#panel-matchups [data-dmatch]').forEach(b => b.addEventListener('click', () => {
+    dailyMatch = +b.dataset.dmatch;
+    const el = document.getElementById('daily');
+    if (el) { el.outerHTML = renderDaily(); bindDaily(); document.getElementById('daily').scrollIntoView({behavior:'smooth', block:'start'}); }
+  }));
   renderStandings();
 }
 function renderAllFilters(){
