@@ -1,0 +1,18 @@
+{
+ "weekly": {
+  "active": false,
+  "bias": -0.0175,
+  "spread": 1.1071,
+  "team_weeks": 12,
+  "raw_level_ratio": 0.9299,
+  "raw_spread": 1.4283,
+  "weight": 0.25,
+  "reason": "needs 24 checked team-weeks (has 12)"
+ },
+ "season": {
+  "active": false,
+  "spread": 1.0,
+  "reason": "no forecast weeks finished yet"
+ },
+ "updated_utc": "2026-11-14T18:07:52.710318+00:00"
+}
