@@ -1,0 +1,19 @@
+{
+ "weekly": {
+  "active": true,
+  "bias": -0.026,
+  "spread": 1.1186,
+  "team_weeks": 24,
+  "raw_level_ratio": 0.9349,
+  "raw_spread": 1.2964,
+  "weight": 0.4,
+  "reason": ""
+ },
+ "season": {
+  "active": false,
+  "spread": 1.1979,
+  "team_weeks": 12,
+  "reason": "needs more finished weeks"
+ },
+ "updated_utc": "2026-11-21T11:08:45.906117+00:00"
+}
